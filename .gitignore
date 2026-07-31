@@ -8,3 +8,17 @@ data/
 *.pdf
 .DS_Store
 .streamlit/secrets.toml
+
+# Local tooling/workspace artifacts
+.agents/
+.tools/
+build/
+dist/
+app.spec
+
+# Generated runtime files
+slips/
+inward_transactions.csv
+vendor_payments.csv
+vendor_catalog.json
+transactions.csv
