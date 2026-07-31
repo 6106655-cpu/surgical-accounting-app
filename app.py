@@ -549,6 +549,26 @@ INWARD_FILE = "inward_transactions.csv"
 PAYMENT_FILE = "vendor_payments.csv"
 DEFAULT_ADMIN_PIN = "1234"
 
+INWARD_COLUMNS = [
+    "Date",
+    "Vendor",
+    "Item",
+    "Quantity",
+    "Unit Rate (PKR)",
+    "Total Amount (PKR)",
+    "Payment Terms",
+]
+
+PAYMENT_COLUMNS = [
+    "Voucher No",
+    "Date",
+    "Vendor",
+    "Amount Paid (PKR)",
+    "Payment Mode",
+    "Payment Purpose / Description",
+    "Reference / Notes",
+]
+
 STORE_STAFF_PAGES = ["Factory Store Slip"]
 ADMIN_PAGES = [
     "Dashboard",
@@ -560,6 +580,38 @@ ADMIN_PAGES = [
     "Items Catalog",
     "Reports",
 ]
+
+
+def ensure_local_data_files() -> None:
+    if not os.path.exists(VENDOR_FILE):
+        with open(VENDOR_FILE, "w") as file_handle:
+            json.dump({}, file_handle)
+
+    if not os.path.exists(INWARD_FILE):
+        pd.DataFrame(columns=INWARD_COLUMNS).to_csv(INWARD_FILE, index=False)
+
+    if not os.path.exists(PAYMENT_FILE):
+        pd.DataFrame(columns=PAYMENT_COLUMNS).to_csv(PAYMENT_FILE, index=False)
+
+
+def safe_read_csv(file_path: str, expected_columns: list[str]) -> pd.DataFrame:
+    if not os.path.exists(file_path):
+        return pd.DataFrame(columns=expected_columns)
+
+    try:
+        df = pd.read_csv(file_path)
+    except Exception:
+        return pd.DataFrame(columns=expected_columns)
+
+    for col in expected_columns:
+        if col not in df.columns:
+            df[col] = ""
+
+    ordered = [col for col in expected_columns if col in df.columns]
+    remaining = [col for col in df.columns if col not in ordered]
+    return df[ordered + remaining]
+
+
 def load_vendor_catalog() -> dict:
     if not os.path.exists(VENDOR_FILE):
         return {}
@@ -642,9 +694,7 @@ def append_inward_record(
 
 
 def load_inward_data() -> pd.DataFrame:
-    if os.path.exists(INWARD_FILE):
-        return pd.read_csv(INWARD_FILE)
-    return pd.DataFrame()
+    return safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
 
 
 def save_inward_data(df: pd.DataFrame) -> None:
@@ -686,9 +736,7 @@ def delete_inward_record(row_id: int) -> None:
 
 
 def load_payments_data() -> pd.DataFrame:
-    if os.path.exists(PAYMENT_FILE):
-        return pd.read_csv(PAYMENT_FILE)
-    return pd.DataFrame()
+    return safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
 
 
 def update_payment_record(
@@ -1014,6 +1062,7 @@ def aggregate_bill_rows(bills_df: pd.DataFrame) -> pd.DataFrame:
     return aggregated
 
 
+ensure_local_data_files()
 vendor_catalog = load_vendor_catalog()
 init_slip_db()
 
@@ -1102,7 +1151,7 @@ with st.sidebar:
     st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
 
 # Load Datasets
-df_inward = pd.read_csv(INWARD_FILE)
+df_inward = load_inward_data()
 df_payments = load_payments_data()
 
 if not df_inward.empty:
