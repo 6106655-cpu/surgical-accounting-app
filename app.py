@@ -580,6 +580,7 @@ WS_VENDOR = "VendorCatalog"
 WS_INWARD = "InwardRecords"
 WS_PAYMENTS = "Payments"
 WS_SLIPS = "StoreSlips"
+DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/11l7bawuKdDKhZLGwzN-hxrOer5CNI2oSkJQTPIDlQLc/edit?gid=0#gid=0"
 
 INWARD_COLUMNS = [
     "Date",
@@ -624,7 +625,11 @@ def _secrets_section(name: str) -> dict:
 
 def _gsheet_target() -> str:
     gs = _secrets_section("gsheets")
-    return str(gs.get("spreadsheet") or gs.get("url") or gs.get("id") or "").strip()
+    return str(gs.get("spreadsheet") or gs.get("url") or gs.get("id") or DEFAULT_GSHEET_URL).strip()
+
+
+def is_google_sheets_configured() -> bool:
+    return bool(_gsheet_target()) and bool(_secrets_section("gcp_service_account"))
 
 
 @st.cache_resource(show_spinner=False)
@@ -657,6 +662,23 @@ def _get_gspread_spreadsheet():
 
 def using_google_sheets() -> bool:
     return _get_gspread_spreadsheet() is not None
+
+
+def google_sheets_status() -> tuple[bool, str]:
+    if gspread is None or Credentials is None:
+        return False, "Google Sheets package missing"
+
+    if not is_google_sheets_configured():
+        return False, "Google Sheets secrets not configured"
+
+    spreadsheet = _get_gspread_spreadsheet()
+    if spreadsheet is None:
+        return False, "Connecting to Google Sheets..."
+
+    try:
+        return True, f"Connected: {spreadsheet.title}"
+    except Exception:
+        return True, "Connected to Google Sheets"
 
 
 def _safe_float(value, default=0.0) -> float:
@@ -748,6 +770,16 @@ def _df_to_sheet(name: str, df: pd.DataFrame, headers: list[str]) -> bool:
         return False
 
 
+def _write_sheet_with_retry(name: str, df: pd.DataFrame, headers: list[str], retries: int = 1) -> bool:
+    attempts = max(1, retries + 1)
+    for attempt in range(attempts):
+        if _df_to_sheet(name, df, headers):
+            return True
+        if attempt < attempts - 1:
+            _get_gspread_spreadsheet.clear()
+    return False
+
+
 def ensure_local_data_files() -> None:
     if not os.path.exists(VENDOR_FILE):
         with open(VENDOR_FILE, "w") as file_handle:
@@ -807,7 +839,7 @@ def load_vendor_catalog() -> dict:
 
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> None:
-    if using_google_sheets():
+    if is_google_sheets_configured():
         rows = []
         for vendor, items in vendor_catalog_data.items():
             if not items:
@@ -815,17 +847,20 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> None:
                 continue
             for item_name, item_rate in items.items():
                 rows.append({"Vendor": vendor, "Item": item_name, "Rate": item_rate})
-        _df_to_sheet(WS_VENDOR, pd.DataFrame(rows, columns=VENDOR_COLUMNS), VENDOR_COLUMNS)
-        return
+        out_df = pd.DataFrame(rows, columns=VENDOR_COLUMNS)
+        if _write_sheet_with_retry(WS_VENDOR, out_df, VENDOR_COLUMNS, retries=1):
+            return
+        st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
 
     with open(VENDOR_FILE, "w") as file_handle:
         json.dump(vendor_catalog_data, file_handle, indent=2)
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
-    if using_google_sheets():
-        _df_to_sheet(WS_PAYMENTS, df, PAYMENT_COLUMNS)
-        return
+    if is_google_sheets_configured():
+        if _write_sheet_with_retry(WS_PAYMENTS, df, PAYMENT_COLUMNS, retries=1):
+            return
+        st.warning("Google Sheets sync failed for payments. Saved locally as fallback.")
     df.to_csv(PAYMENT_FILE, index=False)
 
 
@@ -897,9 +932,10 @@ def load_inward_data() -> pd.DataFrame:
 
 
 def save_inward_data(df: pd.DataFrame) -> None:
-    if using_google_sheets():
-        _df_to_sheet(WS_INWARD, df, INWARD_COLUMNS)
-        return
+    if is_google_sheets_configured():
+        if _write_sheet_with_retry(WS_INWARD, df, INWARD_COLUMNS, retries=1):
+            return
+        st.warning("Google Sheets sync failed for inward records. Saved locally as fallback.")
     df.to_csv(INWARD_FILE, index=False)
 
 
@@ -983,7 +1019,7 @@ def delete_payment_record(row_id: int) -> None:
 
 
 def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, filename: str, created_at: str) -> None:
-    if using_google_sheets():
+    if is_google_sheets_configured():
         slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
         new_row = {
             "slip_code": slip_code,
@@ -994,8 +1030,9 @@ def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, fi
             "filename": filename,
         }
         slips_df = pd.concat([slips_df, pd.DataFrame([new_row])], ignore_index=True)
-        _df_to_sheet(WS_SLIPS, slips_df, SLIP_COLUMNS)
-        return
+        if _write_sheet_with_retry(WS_SLIPS, slips_df, SLIP_COLUMNS, retries=1):
+            return
+        st.warning("Google Sheets sync failed for store slip. Saved locally as fallback.")
 
     save_slip_record(vendor, item, int(quantity), slip_code, filename)
 
@@ -1387,6 +1424,18 @@ with st.sidebar:
         st.session_state.app_selected_page = selected_page
 
     st.markdown("---")
+    gs_connected, gs_status_text = google_sheets_status()
+    if st.button("Refresh Google Sheets connection", use_container_width=True):
+        _get_gspread_spreadsheet.clear()
+        st.rerun()
+
+    if gs_connected:
+        st.success("Google Sheets backup: Active")
+        st.caption(gs_status_text)
+    else:
+        st.warning("Google Sheets backup: Offline")
+        st.caption(gs_status_text)
+
     if is_admin and st.button("📦 Export Local Backup", use_container_width=True):
         backup_bytes, backup_name = build_backup_zip()
         st.download_button(
@@ -1396,10 +1445,6 @@ with st.sidebar:
             mime="application/zip",
             key="erp_backup_download"
         )
-    if using_google_sheets():
-        st.caption("Storage backend: Google Sheets")
-    else:
-        st.caption("Storage backend: Local fallback (configure `st.secrets` for Google Sheets)")
     st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
 
 # Load Datasets
