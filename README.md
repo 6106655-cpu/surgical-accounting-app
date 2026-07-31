@@ -80,6 +80,38 @@ If you later add API keys/passwords, place them in Streamlit app secrets:
 - App settings -> **Secrets**
 - Add the TOML values there (do not commit `.streamlit/secrets.toml`)
 
+### Google Sheets (permanent cloud persistence)
+
+This app can use Google Sheets as the primary data store for:
+
+- vendor catalog
+- inward records
+- payment records
+- store slip index
+
+Add these secrets in Streamlit Cloud -> App -> **Secrets**:
+
+```toml
+[gsheets]
+# Use one of these:
+spreadsheet = "your-google-sheet-name-or-id"
+# url = "https://docs.google.com/spreadsheets/d/...."
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+client_email = "...@....iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+```
+
+Also share your Google Sheet with the service account email as **Editor**.
+
 ### Important note about storage
 
 Streamlit Community Cloud uses ephemeral local disk. Files like generated slips and local databases can reset when the app restarts.

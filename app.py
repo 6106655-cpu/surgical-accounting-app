@@ -13,6 +13,12 @@ import streamlit as st
 from streamlit_option_menu import option_menu
 from db.database import get_connection
 import streamlit.components.v1 as components
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
 from slip_app import (
     build_barcode_image,
     build_print_html,
@@ -549,6 +555,32 @@ INWARD_FILE = "inward_transactions.csv"
 PAYMENT_FILE = "vendor_payments.csv"
 DEFAULT_ADMIN_PIN = "1234"
 
+VENDOR_COLUMNS = ["Vendor", "Item", "Rate"]
+INWARD_COLUMNS = [
+    "Date",
+    "Vendor",
+    "Item",
+    "Quantity",
+    "Unit Rate (PKR)",
+    "Total Amount (PKR)",
+    "Payment Terms",
+]
+PAYMENT_COLUMNS = [
+    "Voucher No",
+    "Date",
+    "Vendor",
+    "Amount Paid (PKR)",
+    "Payment Mode",
+    "Payment Purpose / Description",
+    "Reference / Notes",
+]
+SLIP_COLUMNS = ["slip_code", "vendor", "item", "quantity", "created_at", "filename"]
+
+WS_VENDOR = "VendorCatalog"
+WS_INWARD = "InwardRecords"
+WS_PAYMENTS = "Payments"
+WS_SLIPS = "StoreSlips"
+
 INWARD_COLUMNS = [
     "Date",
     "Vendor",
@@ -582,6 +614,140 @@ ADMIN_PAGES = [
 ]
 
 
+def _secrets_section(name: str) -> dict:
+    try:
+        section = st.secrets[name]
+        return dict(section)
+    except Exception:
+        return {}
+
+
+def _gsheet_target() -> str:
+    gs = _secrets_section("gsheets")
+    return str(gs.get("spreadsheet") or gs.get("url") or gs.get("id") or "").strip()
+
+
+@st.cache_resource(show_spinner=False)
+def _get_gspread_spreadsheet():
+    if gspread is None or Credentials is None:
+        return None
+
+    target = _gsheet_target()
+    if not target:
+        return None
+
+    try:
+        service_account_info = _secrets_section("gcp_service_account")
+        if not service_account_info:
+            return None
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        client = gspread.authorize(creds)
+        if target.startswith("http"):
+            return client.open_by_url(target)
+        if "/" not in target and len(target) >= 30:
+            return client.open_by_key(target)
+        return client.open(target)
+    except Exception:
+        return None
+
+
+def using_google_sheets() -> bool:
+    return _get_gspread_spreadsheet() is not None
+
+
+def _safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _get_or_create_worksheet(name: str, headers: list[str]):
+    spreadsheet = _get_gspread_spreadsheet()
+    if spreadsheet is None:
+        return None
+
+    try:
+        worksheet = spreadsheet.worksheet(name)
+    except Exception:
+        try:
+            worksheet = spreadsheet.add_worksheet(title=name, rows="2000", cols=str(max(20, len(headers) + 4)))
+            worksheet.update("A1", [headers])
+        except Exception:
+            return None
+
+    return worksheet
+
+
+def _sheet_to_df(name: str, headers: list[str]) -> pd.DataFrame:
+    worksheet = _get_or_create_worksheet(name, headers)
+    if worksheet is None:
+        return pd.DataFrame(columns=headers)
+
+    try:
+        values = worksheet.get_all_values()
+    except Exception:
+        return pd.DataFrame(columns=headers)
+
+    if not values:
+        try:
+            worksheet.update("A1", [headers])
+        except Exception:
+            pass
+        return pd.DataFrame(columns=headers)
+
+    sheet_headers = [str(col).strip() for col in values[0]]
+    if not any(sheet_headers):
+        try:
+            worksheet.update("A1", [headers])
+        except Exception:
+            pass
+        return pd.DataFrame(columns=headers)
+
+    rows = values[1:] if len(values) > 1 else []
+    if not rows:
+        df = pd.DataFrame(columns=sheet_headers)
+    else:
+        row_width = len(sheet_headers)
+        normalized_rows = [row + [""] * (row_width - len(row)) for row in rows]
+        df = pd.DataFrame(normalized_rows, columns=sheet_headers)
+
+    for col in headers:
+        if col not in df.columns:
+            df[col] = ""
+
+    ordered = [col for col in headers if col in df.columns]
+    extras = [col for col in df.columns if col not in ordered]
+    return df[ordered + extras]
+
+
+def _df_to_sheet(name: str, df: pd.DataFrame, headers: list[str]) -> bool:
+    worksheet = _get_or_create_worksheet(name, headers)
+    if worksheet is None:
+        return False
+
+    out = df.copy()
+    for col in headers:
+        if col not in out.columns:
+            out[col] = ""
+    out = out[headers].fillna("")
+
+    values = [headers]
+    if not out.empty:
+        values.extend(out.astype(str).values.tolist())
+
+    try:
+        worksheet.clear()
+        worksheet.update("A1", values)
+        return True
+    except Exception:
+        return False
+
+
 def ensure_local_data_files() -> None:
     if not os.path.exists(VENDOR_FILE):
         with open(VENDOR_FILE, "w") as file_handle:
@@ -608,11 +774,28 @@ def safe_read_csv(file_path: str, expected_columns: list[str]) -> pd.DataFrame:
             df[col] = ""
 
     ordered = [col for col in expected_columns if col in df.columns]
-    remaining = [col for col in df.columns if col not in ordered]
-    return df[ordered + remaining]
+    extras = [col for col in df.columns if col not in ordered]
+    return df[ordered + extras]
 
 
 def load_vendor_catalog() -> dict:
+    if using_google_sheets():
+        df = _sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
+        catalog: dict[str, dict] = {}
+        if df.empty:
+            return catalog
+
+        for _, row in df.iterrows():
+            vendor = str(row.get("Vendor", "")).strip()
+            item = str(row.get("Item", "")).strip()
+            if not vendor:
+                continue
+            if vendor not in catalog:
+                catalog[vendor] = {}
+            if item:
+                catalog[vendor][item] = _safe_float(row.get("Rate", 0.0), 0.0)
+        return catalog
+
     if not os.path.exists(VENDOR_FILE):
         return {}
     try:
@@ -624,11 +807,25 @@ def load_vendor_catalog() -> dict:
 
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> None:
+    if using_google_sheets():
+        rows = []
+        for vendor, items in vendor_catalog_data.items():
+            if not items:
+                rows.append({"Vendor": vendor, "Item": "", "Rate": ""})
+                continue
+            for item_name, item_rate in items.items():
+                rows.append({"Vendor": vendor, "Item": item_name, "Rate": item_rate})
+        _df_to_sheet(WS_VENDOR, pd.DataFrame(rows, columns=VENDOR_COLUMNS), VENDOR_COLUMNS)
+        return
+
     with open(VENDOR_FILE, "w") as file_handle:
         json.dump(vendor_catalog_data, file_handle, indent=2)
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
+    if using_google_sheets():
+        _df_to_sheet(WS_PAYMENTS, df, PAYMENT_COLUMNS)
+        return
     df.to_csv(PAYMENT_FILE, index=False)
 
 
@@ -678,26 +875,31 @@ def append_inward_record(
     payment_terms: str,
 ) -> float:
     total_amount = round(quantity * rate, 2)
-    new_data = pd.DataFrame([
-        {
-            "Date": entry_date,
-            "Vendor": vendor,
-            "Item": item,
-            "Quantity": quantity,
-            "Unit Rate (PKR)": rate,
-            "Total Amount (PKR)": total_amount,
-            "Payment Terms": payment_terms,
-        }
-    ])
-    new_data.to_csv(INWARD_FILE, mode="a", header=False, index=False)
+    new_record = {
+        "Date": entry_date,
+        "Vendor": vendor,
+        "Item": item,
+        "Quantity": quantity,
+        "Unit Rate (PKR)": rate,
+        "Total Amount (PKR)": total_amount,
+        "Payment Terms": payment_terms,
+    }
+    existing = load_inward_data()
+    updated = pd.concat([existing, pd.DataFrame([new_record])], ignore_index=True)
+    save_inward_data(updated)
     return total_amount
 
 
 def load_inward_data() -> pd.DataFrame:
+    if using_google_sheets():
+        return _sheet_to_df(WS_INWARD, INWARD_COLUMNS)
     return safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
 
 
 def save_inward_data(df: pd.DataFrame) -> None:
+    if using_google_sheets():
+        _df_to_sheet(WS_INWARD, df, INWARD_COLUMNS)
+        return
     df.to_csv(INWARD_FILE, index=False)
 
 
@@ -736,6 +938,8 @@ def delete_inward_record(row_id: int) -> None:
 
 
 def load_payments_data() -> pd.DataFrame:
+    if using_google_sheets():
+        return _sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
     return safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
 
 
@@ -777,10 +981,67 @@ def delete_payment_record(row_id: int) -> None:
     df = df.drop(index=row_id).reset_index(drop=True)
     save_payment_data(df)
 
+
+def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, filename: str, created_at: str) -> None:
+    if using_google_sheets():
+        slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
+        new_row = {
+            "slip_code": slip_code,
+            "vendor": vendor,
+            "item": item,
+            "quantity": int(quantity),
+            "created_at": created_at,
+            "filename": filename,
+        }
+        slips_df = pd.concat([slips_df, pd.DataFrame([new_row])], ignore_index=True)
+        _df_to_sheet(WS_SLIPS, slips_df, SLIP_COLUMNS)
+        return
+
+    save_slip_record(vendor, item, int(quantity), slip_code, filename)
+
+
+def get_recent_slips_store(limit: int = 8):
+    if using_google_sheets():
+        slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
+        if slips_df.empty:
+            return []
+        slips_df = slips_df.copy()
+        slips_df["_created_sort"] = pd.to_datetime(slips_df["created_at"], errors="coerce")
+        slips_df = slips_df.sort_values("_created_sort", ascending=False).drop(columns=["_created_sort"])
+        records = []
+        for _, row in slips_df.head(limit).iterrows():
+            records.append((
+                str(row.get("slip_code", "")),
+                str(row.get("vendor", "")),
+                str(row.get("item", "")),
+                int(_safe_float(row.get("quantity", 0), 0)),
+                str(row.get("created_at", "")),
+                str(row.get("filename", "")),
+            ))
+        return records
+
+    return get_recent_slips(limit)
+
+
 def lookup_slip_by_barcode(code: str) -> Optional[dict]:
     code = str(code).strip()
     if not code:
         return None
+
+    if using_google_sheets():
+        slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
+        if slips_df.empty:
+            return None
+        match = slips_df[slips_df["slip_code"].astype(str).str.strip() == code]
+        if match.empty:
+            return None
+        row = match.iloc[-1]
+        return {
+            "Vendor": str(row.get("vendor", "")),
+            "Item": str(row.get("item", "")),
+            "Quantity": int(_safe_float(row.get("quantity", 0), 0)),
+        }
+
     barcode_db = "slip_records.db"
     if not os.path.exists(barcode_db):
         return None
@@ -807,37 +1068,30 @@ def import_transactions_from_json(uploaded_file) -> tuple[bool, str]:
         return False, "No file provided."
 
     try:
-        raw = uploaded_file.read()
-        data = json.loads(raw)
+        data = json.load(uploaded_file)
     except Exception as exc:
         return False, f"Invalid JSON file: {exc}"
 
-    # Accept either a top-level list, a dict wrapping the list (common keys: 'transactions', 'data'),
-    # or a single transaction object.
     if isinstance(data, dict):
-        # try common keys first
-        for key in ("transactions", "data", "items", "records"):
-            if key in data and isinstance(data[key], list):
-                data = data[key]
-                break
+        if "transactions" in data and isinstance(data["transactions"], list):
+            data = data["transactions"]
+        elif "data" in data and isinstance(data["data"], list):
+            data = data["data"]
         else:
-            # attempt to find the first nested list of dict-like objects anywhere in the dict
             def find_transactions_list(obj, depth=0, max_depth=4):
                 if depth > max_depth:
                     return None
                 if isinstance(obj, list):
-                    # prefer lists of dicts
                     if all(isinstance(x, dict) for x in obj) and len(obj) > 0:
                         return obj
-                    # if list elements are lists/dicts, try to find inside
                     for item in obj:
                         res = find_transactions_list(item, depth + 1, max_depth)
                         if res:
                             return res
                     return None
                 if isinstance(obj, dict):
-                    for v in obj.values():
-                        res = find_transactions_list(v, depth + 1, max_depth)
+                    for val in obj.values():
+                        res = find_transactions_list(val, depth + 1, max_depth)
                         if res:
                             return res
                 return None
@@ -846,21 +1100,18 @@ def import_transactions_from_json(uploaded_file) -> tuple[bool, str]:
             if found is not None:
                 data = found
             else:
-                # if dict looks like a single transaction (has common transaction keys), wrap it
                 tx_keys = {"date", "description", "amount", "category", "Date", "Description", "Amount", "Category"}
-                if any(k in data for k in tx_keys):
+                if any(key in data for key in tx_keys):
                     data = [data]
                 else:
                     return False, "JSON must be an array of transaction objects or contain one under a key like 'transactions' or 'data'."
     elif not isinstance(data, list):
-        # if it's a single primitive or unexpected type, fail
         return False, "JSON must be an array of transaction objects or an object containing such an array."
 
     conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
-        # ensure transactions table exists
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS transactions (
@@ -889,7 +1140,6 @@ def import_transactions_from_json(uploaded_file) -> tuple[bool, str]:
                 )
                 inserted += 1
             except Exception:
-                # skip rows that fail conversion/constraints
                 continue
 
         conn.commit()
@@ -902,12 +1152,9 @@ def import_transactions_from_json(uploaded_file) -> tuple[bool, str]:
 
 
 def build_backup_zip() -> tuple[bytes, str]:
-    inward_df = pd.read_csv(INWARD_FILE) if os.path.exists(INWARD_FILE) else pd.DataFrame()
+    inward_df = load_inward_data()
     payments_df = load_payments_data()
-    vendors_data = {}
-    if os.path.exists(VENDOR_FILE):
-        with open(VENDOR_FILE, "r") as f:
-            vendors_data = json.load(f)
+    vendors_data = load_vendor_catalog()
 
     ledger_items = []
     for vendor in sorted(vendors_data.keys()):
@@ -1064,7 +1311,8 @@ def aggregate_bill_rows(bills_df: pd.DataFrame) -> pd.DataFrame:
 
 ensure_local_data_files()
 vendor_catalog = load_vendor_catalog()
-init_slip_db()
+if not using_google_sheets():
+    init_slip_db()
 
 # Sidebar Navigation
 with st.sidebar:
@@ -1148,6 +1396,10 @@ with st.sidebar:
             mime="application/zip",
             key="erp_backup_download"
         )
+    if using_google_sheets():
+        st.caption("Storage backend: Google Sheets")
+    else:
+        st.caption("Storage backend: Local fallback (configure `st.secrets` for Google Sheets)")
     st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
 
 # Load Datasets
@@ -1318,7 +1570,7 @@ elif selected_page == "Factory Store Slip":
 
                 slip_filename = os.path.join("slips", f"slip_{slip_code}.png")
                 slip_image.save(slip_filename)
-                save_slip_record(selected_slip_vendor, normalized_item, int(slip_quantity), slip_code, slip_filename)
+                append_slip_record(selected_slip_vendor, normalized_item, int(slip_quantity), slip_code, slip_filename, created_at)
 
                 append_inward_record(
                     datetime.now().strftime("%Y-%m-%d"),
@@ -1388,7 +1640,7 @@ elif selected_page == "Factory Store Slip":
                 key="download_printable_slip_html",
             )
 
-    recent_slips = get_recent_slips(8)
+    recent_slips = get_recent_slips_store(8)
     with st.container(border=True):
         st.subheader("Recent slips")
         if recent_slips:
@@ -1604,7 +1856,8 @@ elif selected_page == "Payments & Voucher":
                     "Payment Purpose / Description": p_purpose if p_purpose else "Payment Made against Inward/Job",
                     "Reference / Notes": p_notes if p_notes else "-"
                 }])
-                new_pay.to_csv(PAYMENT_FILE, mode='a', header=False, index=False)
+                existing_payments = load_payments_data()
+                save_payment_data(pd.concat([existing_payments, new_pay], ignore_index=True))
                 st.session_state['selected_voucher'] = next_v_num
                 st.success(f"✅ Payment Saved! Voucher {next_v_num} created successfully.")
                 st.rerun()
