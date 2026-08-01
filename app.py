@@ -4,9 +4,11 @@ import json
 import os
 import shutil
 import sqlite3
+import time
 import traceback
 import uuid
 import zipfile
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -711,6 +713,13 @@ ADMIN_PAGES = [
 AUTH_ROLE_ADMIN = "admin"
 AUTH_ROLE_STORE_MANAGER = "store_manager"
 
+SESSION_DATA_CACHE_KEY = "_prexa_session_data_cache"
+STATUS_CACHE_TTL_SECONDS = 30
+VENDOR_CACHE_TTL_SECONDS = 20
+INWARD_CACHE_TTL_SECONDS = 20
+PAYMENT_CACHE_TTL_SECONDS = 20
+SLIP_CACHE_TTL_SECONDS = 15
+
 
 def _ensure_local_backup_dirs() -> None:
     for backup_dir in (LOCAL_BACKUP_ROOT, VENDOR_BACKUP_DIR, INWARD_BACKUP_DIR, PAYMENT_BACKUP_DIR):
@@ -826,6 +835,48 @@ def _secrets_section(name: str) -> dict:
         return dict(section)
     except Exception:
         return {}
+
+
+def _ensure_session_data_cache() -> dict:
+    cache_store = st.session_state.get(SESSION_DATA_CACHE_KEY)
+    if not isinstance(cache_store, dict):
+        cache_store = {}
+        st.session_state[SESSION_DATA_CACHE_KEY] = cache_store
+    return cache_store
+
+
+def _clone_cache_value(value):
+    if isinstance(value, pd.DataFrame):
+        return value.copy(deep=True)
+    if isinstance(value, (dict, list, tuple, set)):
+        return deepcopy(value)
+    return value
+
+
+def _get_session_cached_value(cache_key: str, ttl_seconds: int):
+    cache_store = _ensure_session_data_cache()
+    entry = cache_store.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+
+    cached_at = float(entry.get("cached_at", 0.0))
+    if cached_at <= 0.0 or (time.time() - cached_at) > float(ttl_seconds):
+        cache_store.pop(cache_key, None)
+        return None
+
+    return _clone_cache_value(entry.get("value"))
+
+
+def _set_session_cached_value(cache_key: str, value) -> None:
+    cache_store = _ensure_session_data_cache()
+    cache_store[cache_key] = {
+        "cached_at": time.time(),
+        "value": _clone_cache_value(value),
+    }
+
+
+def _clear_session_data_cache() -> None:
+    st.session_state.pop(SESSION_DATA_CACHE_KEY, None)
 
 
 def _gsheet_target() -> str:
@@ -988,6 +1039,7 @@ def google_sheets_write_enabled() -> bool:
 
 
 def _refresh_app_data_after_submit() -> None:
+    _clear_session_data_cache()
     _get_gspread_spreadsheet.clear()
     _public_sheet_ping.clear()
     _public_sheet_ping_by_name.clear()
@@ -1090,28 +1142,45 @@ def using_google_sheets() -> bool:
 
 
 def google_sheets_status() -> tuple[bool, str]:
+    cached_status = _get_session_cached_value("gsheets_status", STATUS_CACHE_TTL_SECONDS)
+    if isinstance(cached_status, tuple) and len(cached_status) == 2:
+        return bool(cached_status[0]), str(cached_status[1])
+
+    status: tuple[bool, str]
     spreadsheet = _get_gspread_spreadsheet()
     if spreadsheet is not None:
         try:
-            return True, f"Connected (read/write): {spreadsheet.title}"
+            status = (True, f"Connected (read/write): {spreadsheet.title}")
         except Exception:
-            return True, "Connected (read/write) to Google Sheets"
+            status = (True, "Connected (read/write) to Google Sheets")
+        _set_session_cached_value("gsheets_status", status)
+        return status
 
     sheet_key = _public_sheet_key()
     public_gid = _public_sheet_gid(WS_INWARD)
     if sheet_key:
         if public_gid is not None and _public_sheet_ping(sheet_key, public_gid):
-            return True, "Connected (public read-only mode)"
+            status = (True, "Connected (public read-only mode)")
+            _set_session_cached_value("gsheets_status", status)
+            return status
         if _public_sheet_ping_by_name(sheet_key, WS_INWARD):
-            return True, "Connected (public read-only mode)"
+            status = (True, "Connected (public read-only mode)")
+            _set_session_cached_value("gsheets_status", status)
+            return status
 
     if has_google_service_account():
-        return False, "Service account configured, but sheet access failed. Check share permissions."
+        status = (False, "Service account configured, but sheet access failed. Check share permissions.")
+        _set_session_cached_value("gsheets_status", status)
+        return status
 
     if sheet_key:
-        return False, "Public sheet configured but not accessible yet (publish/share or check gid)."
+        status = (False, "Public sheet configured but not accessible yet (publish/share or check gid).")
+        _set_session_cached_value("gsheets_status", status)
+        return status
 
-    return False, "Google Sheets not configured. Running with local storage fallback."
+    status = (False, "Google Sheets not configured. Running with local storage fallback.")
+    _set_session_cached_value("gsheets_status", status)
+    return status
 
 
 def _admin_pin_value() -> str:
@@ -1590,6 +1659,10 @@ def safe_read_csv(file_path: str, expected_columns: list[str]) -> pd.DataFrame:
 
 
 def load_vendor_catalog() -> dict:
+    cached_catalog = _get_session_cached_value("vendor_catalog", VENDOR_CACHE_TTL_SECONDS)
+    if isinstance(cached_catalog, dict):
+        return cached_catalog
+
     def _catalog_from_df(df: Optional[pd.DataFrame]) -> dict:
         normalized_df = _normalize_vendor_catalog_df(df)
         if normalized_df.empty:
@@ -1653,11 +1726,13 @@ def load_vendor_catalog() -> dict:
             catalog.setdefault(vendor_name, {})
 
         if catalog:
+            _set_session_cached_value("vendor_catalog", catalog)
             return catalog
 
     public_df = _public_sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
     public_catalog = _catalog_from_df(public_df)
     if public_catalog:
+        _set_session_cached_value("vendor_catalog", public_catalog)
         return public_catalog
 
     if not os.path.exists(VENDOR_FILE):
@@ -1666,7 +1741,9 @@ def load_vendor_catalog() -> dict:
     try:
         with open(VENDOR_FILE, "r") as file_handle:
             data = json.load(file_handle)
-        return data if isinstance(data, dict) else {}
+        result = data if isinstance(data, dict) else {}
+        _set_session_cached_value("vendor_catalog", result)
+        return result
     except Exception:
         return {}
 
@@ -1949,14 +2026,23 @@ def append_inward_record(
 
 
 def load_inward_data() -> pd.DataFrame:
+    cached_inward = _get_session_cached_value("inward_data", INWARD_CACHE_TTL_SECONDS)
+    if isinstance(cached_inward, pd.DataFrame):
+        return cached_inward
+
     if using_google_sheets():
-        return _sheet_to_df(WS_INWARD, INWARD_COLUMNS)
+        df = _sheet_to_df(WS_INWARD, INWARD_COLUMNS)
+        _set_session_cached_value("inward_data", df)
+        return df
 
     public_df = _public_sheet_to_df(WS_INWARD, INWARD_COLUMNS)
     if public_df is not None:
+        _set_session_cached_value("inward_data", public_df)
         return public_df
 
-    return safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
+    local_df = safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
+    _set_session_cached_value("inward_data", local_df)
+    return local_df
 
 
 def save_inward_data(df: pd.DataFrame) -> None:
@@ -2004,14 +2090,23 @@ def delete_inward_record(row_id: int) -> None:
 
 
 def load_payments_data() -> pd.DataFrame:
+    cached_payments = _get_session_cached_value("payments_data", PAYMENT_CACHE_TTL_SECONDS)
+    if isinstance(cached_payments, pd.DataFrame):
+        return cached_payments
+
     if using_google_sheets():
-        return _sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
+        df = _sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
+        _set_session_cached_value("payments_data", df)
+        return df
 
     public_df = _public_sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
     if public_df is not None:
+        _set_session_cached_value("payments_data", public_df)
         return public_df
 
-    return safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
+    local_df = safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
+    _set_session_cached_value("payments_data", local_df)
+    return local_df
 
 
 def update_payment_record(
@@ -2074,9 +2169,15 @@ def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, fi
 
 
 def get_recent_slips_store(limit: int = 8):
+    cache_key = f"recent_slips::{int(limit)}"
+    cached_slips = _get_session_cached_value(cache_key, SLIP_CACHE_TTL_SECONDS)
+    if isinstance(cached_slips, list):
+        return cached_slips
+
     if using_google_sheets():
         slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
         if slips_df.empty:
+            _set_session_cached_value(cache_key, [])
             return []
         slips_df = slips_df.copy()
         slips_df["_created_sort"] = pd.to_datetime(slips_df["created_at"], errors="coerce")
@@ -2091,6 +2192,7 @@ def get_recent_slips_store(limit: int = 8):
                 str(row.get("created_at", "")),
                 str(row.get("filename", "")),
             ))
+        _set_session_cached_value(cache_key, records)
         return records
 
     public_df = _public_sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
@@ -2108,9 +2210,12 @@ def get_recent_slips_store(limit: int = 8):
                 str(row.get("created_at", "")),
                 str(row.get("filename", "")),
             ))
+        _set_session_cached_value(cache_key, records)
         return records
 
-    return get_recent_slips(limit)
+    fallback_records = get_recent_slips(limit)
+    _set_session_cached_value(cache_key, fallback_records)
+    return fallback_records
 
 
 def lookup_slip_by_barcode(code: str) -> Optional[dict]:
