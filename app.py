@@ -773,7 +773,6 @@ def _public_sheet_gid(sheet_name: str) -> Optional[str]:
     return "0"
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
     if not sheet_key or gid is None:
         return None
@@ -796,7 +795,6 @@ def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
     return None
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def _read_public_sheet_by_name(sheet_key: str, sheet_name: str) -> Optional[pd.DataFrame]:
     if not sheet_key or not sheet_name:
         return None
@@ -833,14 +831,12 @@ def _public_sheet_to_df(name: str, headers: list[str]) -> Optional[pd.DataFrame]
     return df[ordered + extras]
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def _public_sheet_ping(sheet_key: str, gid: str) -> bool:
     if not sheet_key or gid is None:
         return False
     return _read_public_sheet_csv(sheet_key, gid) is not None
 
 
-@st.cache_data(show_spinner=False, ttl=120)
 def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
     if not sheet_key or not sheet_name:
         return False
@@ -849,6 +845,12 @@ def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
 
 def google_sheets_write_enabled() -> bool:
     return _get_gspread_spreadsheet() is not None
+
+
+def _clear_optional_cache(func) -> None:
+    clear_func = getattr(func, "clear", None)
+    if callable(clear_func):
+        clear_func()
 
 
 def _open_spreadsheet_with_fallback(client, target: str, sheet_name: str):
@@ -931,6 +933,12 @@ def _get_gspread_spreadsheet():
         return None
 
 
+def _get_gspread_spreadsheet_live():
+    # Force a fresh connection so Google Sheets updates are visible on each rerun.
+    _clear_optional_cache(_get_gspread_spreadsheet)
+    return _get_gspread_spreadsheet()
+
+
 def using_google_sheets() -> bool:
     spreadsheet = _get_gspread_spreadsheet()
     if spreadsheet is not None:
@@ -938,7 +946,7 @@ def using_google_sheets() -> bool:
 
     # Recover from a stale cached failure in long-running Streamlit sessions.
     if has_google_service_account():
-        _get_gspread_spreadsheet.clear()
+        _clear_optional_cache(_get_gspread_spreadsheet)
         return _get_gspread_spreadsheet() is not None
 
     return False
@@ -997,6 +1005,10 @@ def _service_account_email_from_info(info: dict) -> str:
 
 def _get_or_create_worksheet(name: str, headers: list[str]):
     spreadsheet = _get_gspread_spreadsheet()
+    return _get_or_create_worksheet_from_spreadsheet(spreadsheet, name, headers)
+
+
+def _get_or_create_worksheet_from_spreadsheet(spreadsheet, name: str, headers: list[str]):
     if spreadsheet is None:
         return None
 
@@ -1086,7 +1098,7 @@ def _write_sheet_with_retry(name: str, df: pd.DataFrame, headers: list[str], ret
         if _df_to_sheet(name, df, headers):
             return True
         if attempt < attempts - 1:
-            _get_gspread_spreadsheet.clear()
+            _clear_optional_cache(_get_gspread_spreadsheet)
     return False
 
 
@@ -1432,10 +1444,9 @@ def load_vendor_catalog() -> dict:
 
         return catalog
 
-    spreadsheet = _get_gspread_spreadsheet()
+    spreadsheet = _get_gspread_spreadsheet_live()
     if spreadsheet is None and has_google_service_account():
-        _get_gspread_spreadsheet.clear()
-        spreadsheet = _get_gspread_spreadsheet()
+        spreadsheet = _get_gspread_spreadsheet_live()
 
     if spreadsheet is not None:
         worksheet = _resolve_worksheet_case_insensitive(spreadsheet, WS_VENDOR)
@@ -1494,12 +1505,13 @@ def load_vendor_catalog() -> dict:
 
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
-    if google_sheets_write_enabled():
+    spreadsheet = _get_gspread_spreadsheet_live()
+    if spreadsheet is not None:
         try:
-            worksheet = _get_or_create_worksheet(WS_VENDOR, VENDOR_COLUMNS)
+            worksheet = _get_or_create_worksheet_from_spreadsheet(spreadsheet, WS_VENDOR, VENDOR_COLUMNS)
             if worksheet is not None:
                 _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data)
-                master_ws = _get_or_create_worksheet(WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
+                master_ws = _get_or_create_worksheet_from_spreadsheet(spreadsheet, WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
                 if master_ws is not None:
                     _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data))
                 return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
@@ -1515,6 +1527,40 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
     if details:
         return False, f"Saved locally; Google Sheets sync failed.\n{details}"
     return False, "Saved locally; Google Sheets sync was unavailable or failed."
+
+
+def _fresh_vendor_catalog_for_ui() -> dict:
+    """Return a normalized, live vendor catalog for frontend widgets."""
+    source = load_vendor_catalog()
+    if not isinstance(source, dict):
+        return {}
+
+    normalized: dict[str, dict] = {}
+    vendor_key_to_name: dict[str, str] = {}
+
+    for raw_vendor, raw_items in source.items():
+        vendor_name = " ".join(str(raw_vendor).strip().split())
+        if not vendor_name:
+            continue
+
+        vendor_key = vendor_name.casefold()
+        canonical_name = vendor_key_to_name.get(vendor_key)
+        if canonical_name is None:
+            vendor_key_to_name[vendor_key] = vendor_name
+            canonical_name = vendor_name
+            normalized[canonical_name] = {}
+
+        item_bucket = normalized.setdefault(canonical_name, {})
+        if not isinstance(raw_items, dict):
+            continue
+
+        for raw_item, raw_rate in raw_items.items():
+            item_name = " ".join(str(raw_item).strip().split())
+            if not item_name:
+                continue
+            item_bucket[item_name] = _safe_float(raw_rate, 0.0)
+
+    return normalized
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
@@ -2049,9 +2095,9 @@ def aggregate_bill_rows(bills_df: pd.DataFrame) -> pd.DataFrame:
 
 
 ensure_local_data_files()
-vendor_catalog = load_vendor_catalog()
 if not using_google_sheets():
     init_slip_db()
+vendor_catalog = _fresh_vendor_catalog_for_ui()
 
 # Sidebar Navigation
 with st.sidebar:
@@ -2128,11 +2174,11 @@ with st.sidebar:
     st.markdown("---")
     gs_connected, gs_status_text = google_sheets_status()
     if st.button("Refresh Google Sheets connection", use_container_width=True):
-        _get_gspread_spreadsheet.clear()
-        _public_sheet_ping.clear()
-        _public_sheet_ping_by_name.clear()
-        _read_public_sheet_csv.clear()
-        _read_public_sheet_by_name.clear()
+        _clear_optional_cache(_get_gspread_spreadsheet)
+        _clear_optional_cache(_public_sheet_ping)
+        _clear_optional_cache(_public_sheet_ping_by_name)
+        _clear_optional_cache(_read_public_sheet_csv)
+        _clear_optional_cache(_read_public_sheet_by_name)
         st.rerun()
 
     if gs_connected:
@@ -2152,6 +2198,9 @@ with st.sidebar:
             key="erp_backup_download"
         )
     st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
+
+# Always render vendor widgets from a fresh synchronized source.
+vendor_catalog = _fresh_vendor_catalog_for_ui()
 
 # Load Datasets
 df_inward = load_inward_data()
