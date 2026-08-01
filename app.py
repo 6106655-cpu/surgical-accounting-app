@@ -2,6 +2,7 @@ import io
 import importlib
 import json
 import os
+import shutil
 import sqlite3
 import traceback
 import uuid
@@ -637,6 +638,10 @@ st.markdown("""
 VENDOR_FILE = "vendor_catalog.json"
 INWARD_FILE = "inward_transactions.csv"
 PAYMENT_FILE = "vendor_payments.csv"
+LOCAL_BACKUP_ROOT = Path("data") / "local_backups"
+VENDOR_BACKUP_DIR = LOCAL_BACKUP_ROOT / "vendors"
+INWARD_BACKUP_DIR = LOCAL_BACKUP_ROOT / "inward_entries"
+PAYMENT_BACKUP_DIR = LOCAL_BACKUP_ROOT / "payments"
 DEFAULT_ADMIN_PIN = "1234"
 
 VENDOR_COLUMNS = ["Vendor", "Item", "Rate"]
@@ -705,6 +710,114 @@ ADMIN_PAGES = [
 
 AUTH_ROLE_ADMIN = "admin"
 AUTH_ROLE_STORE_MANAGER = "store_manager"
+
+
+def _ensure_local_backup_dirs() -> None:
+    for backup_dir in (LOCAL_BACKUP_ROOT, VENDOR_BACKUP_DIR, INWARD_BACKUP_DIR, PAYMENT_BACKUP_DIR):
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _backup_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _backup_existing_local_file(file_path: Path, backup_dir: Path, prefix: str) -> None:
+    if not file_path.exists() or not file_path.is_file():
+        return
+    _ensure_local_backup_dirs()
+    destination = backup_dir / f"{prefix}_{_backup_timestamp()}_{uuid.uuid4().hex[:8]}.bak"
+    try:
+        shutil.copy2(file_path, destination)
+    except Exception:
+        pass
+
+
+def _write_json_snapshot(backup_dir: Path, prefix: str, payload: object) -> None:
+    _ensure_local_backup_dirs()
+    destination = backup_dir / f"{prefix}_{_backup_timestamp()}_{uuid.uuid4().hex[:8]}.json"
+    try:
+        with open(destination, "w", encoding="utf-8") as backup_file:
+            json.dump(payload, backup_file, indent=2)
+    except Exception:
+        pass
+
+
+def _write_csv_snapshot(backup_dir: Path, prefix: str, df: pd.DataFrame, columns: list[str]) -> None:
+    _ensure_local_backup_dirs()
+    destination = backup_dir / f"{prefix}_{_backup_timestamp()}_{uuid.uuid4().hex[:8]}.csv"
+    snapshot = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=columns)
+    for col in columns:
+        if col not in snapshot.columns:
+            snapshot[col] = ""
+    try:
+        snapshot[columns].to_csv(destination, index=False)
+    except Exception:
+        pass
+
+
+def _persist_vendor_local_backup(vendor_catalog_data: dict, source: str) -> None:
+    _write_json_snapshot(
+        VENDOR_BACKUP_DIR,
+        "vendor_catalog",
+        {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "data": vendor_catalog_data,
+        },
+    )
+    vendor_file = Path(VENDOR_FILE)
+    _backup_existing_local_file(vendor_file, VENDOR_BACKUP_DIR, "vendor_catalog_cache")
+    try:
+        with open(vendor_file, "w", encoding="utf-8") as file_handle:
+            json.dump(vendor_catalog_data, file_handle, indent=2)
+    except Exception:
+        pass
+
+
+def _persist_inward_local_backup(df: pd.DataFrame, source: str) -> None:
+    _write_csv_snapshot(INWARD_BACKUP_DIR, "inward_entries", df, INWARD_COLUMNS)
+    _write_json_snapshot(
+        INWARD_BACKUP_DIR,
+        "inward_metadata",
+        {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "row_count": int(len(df.index)) if isinstance(df, pd.DataFrame) else 0,
+        },
+    )
+    inward_file = Path(INWARD_FILE)
+    _backup_existing_local_file(inward_file, INWARD_BACKUP_DIR, "inward_cache")
+    try:
+        local_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=INWARD_COLUMNS)
+        for col in INWARD_COLUMNS:
+            if col not in local_df.columns:
+                local_df[col] = ""
+        local_df[INWARD_COLUMNS].to_csv(inward_file, index=False)
+    except Exception:
+        pass
+
+
+def _persist_payment_local_backup(df: pd.DataFrame, source: str) -> None:
+    _write_csv_snapshot(PAYMENT_BACKUP_DIR, "payments", df, PAYMENT_COLUMNS)
+    _write_json_snapshot(
+        PAYMENT_BACKUP_DIR,
+        "payment_metadata",
+        {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "source": source,
+            "row_count": int(len(df.index)) if isinstance(df, pd.DataFrame) else 0,
+        },
+    )
+    payment_file = Path(PAYMENT_FILE)
+    _backup_existing_local_file(payment_file, PAYMENT_BACKUP_DIR, "payment_cache")
+    try:
+        local_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=PAYMENT_COLUMNS)
+        for col in PAYMENT_COLUMNS:
+            if col not in local_df.columns:
+                local_df[col] = ""
+        local_df[PAYMENT_COLUMNS].to_csv(payment_file, index=False)
+    except Exception:
+        pass
 
 
 def _secrets_section(name: str) -> dict:
@@ -1425,6 +1538,7 @@ def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, 
 
     Any auth/permission/network error is intentionally raised so Streamlit shows the full traceback.
     """
+    _persist_vendor_local_backup(vendor_catalog_data, source="save_vendor_to_google_sheets_strict")
     spreadsheet = _get_gspread_spreadsheet_strict()
 
     try:
@@ -1444,6 +1558,8 @@ def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, 
 
 
 def ensure_local_data_files() -> None:
+    _ensure_local_backup_dirs()
+
     if not os.path.exists(VENDOR_FILE):
         with open(VENDOR_FILE, "w") as file_handle:
             json.dump({}, file_handle)
@@ -1556,6 +1672,8 @@ def load_vendor_catalog() -> dict:
 
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
+    _persist_vendor_local_backup(vendor_catalog_data, source="save_vendor_catalog")
+
     if google_sheets_write_enabled():
         try:
             worksheet = _get_or_create_worksheet(WS_VENDOR, VENDOR_COLUMNS)
@@ -1571,8 +1689,6 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
         if has_google_service_account():
             st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
 
-    with open(VENDOR_FILE, "w") as file_handle:
-        json.dump(vendor_catalog_data, file_handle, indent=2)
     details = _last_gsheets_error().strip()
     if details:
         return False, f"Saved locally; Google Sheets sync failed.\n{details}"
@@ -1580,12 +1696,13 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
+    _persist_payment_local_backup(df, source="save_payment_data")
+
     if google_sheets_write_enabled():
         if _write_sheet_with_retry(WS_PAYMENTS, df, PAYMENT_COLUMNS, retries=1):
             return
         if has_google_service_account():
             st.warning("Google Sheets sync failed for payments. Saved locally as fallback.")
-    df.to_csv(PAYMENT_FILE, index=False)
 
 
 def parse_optional_rate(rate_value: str) -> float:
@@ -1843,12 +1960,13 @@ def load_inward_data() -> pd.DataFrame:
 
 
 def save_inward_data(df: pd.DataFrame) -> None:
+    _persist_inward_local_backup(df, source="save_inward_data")
+
     if google_sheets_write_enabled():
         if _write_sheet_with_retry(WS_INWARD, df, INWARD_COLUMNS, retries=1):
             return
         if has_google_service_account():
             st.warning("Google Sheets sync failed for inward records. Saved locally as fallback.")
-    df.to_csv(INWARD_FILE, index=False)
 
 
 def update_inward_record(
