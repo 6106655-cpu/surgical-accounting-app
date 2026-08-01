@@ -851,6 +851,40 @@ def google_sheets_write_enabled() -> bool:
     return _get_gspread_spreadsheet() is not None
 
 
+def _open_spreadsheet_with_fallback(client, target: str, sheet_name: str):
+    target_value = str(target or "").strip()
+    name_value = str(sheet_name or "").strip()
+    target_key = _sheet_key_from_target(target_value)
+
+    attempts: list[tuple[str, object]] = []
+    if target_value.startswith("http"):
+        attempts.append((f"URL '{target_value}'", lambda: client.open_by_url(target_value)))
+    if target_key:
+        attempts.append((f"key '{target_key}'", lambda: client.open_by_key(target_key)))
+    if name_value:
+        attempts.append((f"name '{name_value}'", lambda: client.open(name_value)))
+    if target_value and not target_value.startswith("http") and not target_key:
+        attempts.append((f"name '{target_value}'", lambda: client.open(target_value)))
+
+    attempted_labels = []
+    seen_labels = set()
+    last_error = None
+    for label, opener in attempts:
+        if label in seen_labels:
+            continue
+        seen_labels.add(label)
+        attempted_labels.append(label)
+        try:
+            return opener()
+        except Exception as exc:
+            last_error = exc
+
+    attempts_text = ", ".join(attempted_labels) if attempted_labels else "no targets"
+    if last_error is not None:
+        raise RuntimeError(f"Unable to open Google Sheet using {attempts_text}. Last error: {last_error}") from last_error
+    raise RuntimeError(f"Unable to open Google Sheet using {attempts_text}.")
+
+
 @st.cache_resource(show_spinner=False)
 def _get_gspread_spreadsheet():
     if gspread is None or Credentials is None:
@@ -880,15 +914,7 @@ def _get_gspread_spreadsheet():
 
         client = gspread.authorize(creds)
 
-        spreadsheet = None
-        if sheet_name:
-            spreadsheet = client.open(sheet_name)
-        elif target.startswith("http"):
-            spreadsheet = client.open_by_url(target)
-        elif "/" not in target and len(target) >= 30:
-            spreadsheet = client.open_by_key(target)
-        else:
-            spreadsheet = client.open(target)
+        spreadsheet = _open_spreadsheet_with_fallback(client, target, sheet_name)
 
         # No-op write probe to ensure service-account write access exists.
         spreadsheet.batch_update({"requests": []})
@@ -906,7 +932,16 @@ def _get_gspread_spreadsheet():
 
 
 def using_google_sheets() -> bool:
-    return _get_gspread_spreadsheet() is not None
+    spreadsheet = _get_gspread_spreadsheet()
+    if spreadsheet is not None:
+        return True
+
+    # Recover from a stale cached failure in long-running Streamlit sessions.
+    if has_google_service_account():
+        _get_gspread_spreadsheet.clear()
+        return _get_gspread_spreadsheet() is not None
+
+    return False
 
 
 def google_sheets_status() -> tuple[bool, str]:
@@ -1133,6 +1168,21 @@ def _vendor_catalog_rows(vendor_catalog_data: dict) -> list[list[object]]:
     return rows
 
 
+def _vendor_names_from_catalog(vendor_catalog_data: dict) -> list[str]:
+    vendor_names: list[str] = []
+    seen: set[str] = set()
+    for vendor_name in vendor_catalog_data.keys():
+        vendor = str(vendor_name).strip()
+        if not vendor:
+            continue
+        vendor_key = vendor.casefold()
+        if vendor_key in seen:
+            continue
+        seen.add(vendor_key)
+        vendor_names.append(vendor)
+    return vendor_names
+
+
 def _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data: dict) -> None:
     existing_values = worksheet.get_all_values()
     if not existing_values:
@@ -1172,6 +1222,110 @@ def _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data: dict) -> None:
             worksheet.append_row(payload, value_input_option="USER_ENTERED")
 
 
+def _normalize_sheet_header(value: object) -> str:
+    text = str(value or "").replace("\ufeff", "")
+    return " ".join(text.strip().split()).casefold()
+
+
+def _upsert_vendor_master_sheet(
+    worksheet,
+    vendor_names: list[str],
+    contact: str = "",
+    address: str = "",
+) -> None:
+    names = [str(name).strip() for name in vendor_names if str(name).strip()]
+    if not names:
+        return
+
+    values = worksheet.get_all_values()
+    if not values:
+        worksheet.update("A1", [VENDOR_MASTER_COLUMNS])
+        values = [VENDOR_MASTER_COLUMNS]
+
+    raw_header = [str(col).strip() for col in values[0]]
+    header_map = {_normalize_sheet_header(col): idx for idx, col in enumerate(raw_header) if str(col).strip()}
+    vendor_idx = header_map.get("vendor")
+    contact_idx = header_map.get("contact")
+    address_idx = header_map.get("address")
+
+    if vendor_idx is None:
+        worksheet.update("A1:C1", [VENDOR_MASTER_COLUMNS])
+        raw_header = VENDOR_MASTER_COLUMNS
+        vendor_idx, contact_idx, address_idx = 0, 1, 2
+
+    existing_row_by_vendor: dict[str, int] = {}
+    for row_number, row in enumerate(values[1:], start=2):
+        existing_vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
+        if existing_vendor:
+            existing_row_by_vendor[existing_vendor.casefold()] = row_number
+
+    for vendor in names:
+        key = vendor.casefold()
+        row_payload = [vendor, contact.strip(), address.strip()]
+        if key in existing_row_by_vendor:
+            row_number = existing_row_by_vendor[key]
+            if contact.strip() or address.strip():
+                worksheet.update(
+                    f"A{row_number}:C{row_number}",
+                    [row_payload],
+                    value_input_option="USER_ENTERED",
+                )
+        else:
+            worksheet.append_row(row_payload, value_input_option="USER_ENTERED")
+
+
+def _load_vendor_names_from_master_sheet(spreadsheet) -> list[str]:
+    worksheet = _resolve_worksheet_case_insensitive(spreadsheet, WS_VENDOR_MASTER)
+    if worksheet is None:
+        return []
+
+    values = worksheet.get_all_values()
+    if not values:
+        return []
+
+    header_map = {
+        _normalize_sheet_header(header): idx
+        for idx, header in enumerate(values[0])
+        if str(header).strip()
+    }
+    vendor_idx = header_map.get("vendor", 0)
+
+    vendor_names: list[str] = []
+    seen: set[str] = set()
+    for row in values[1:]:
+        vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
+        if not vendor:
+            continue
+        vendor_key = vendor.casefold()
+        if vendor_key in seen:
+            continue
+        seen.add(vendor_key)
+        vendor_names.append(vendor)
+
+    return vendor_names
+
+
+def _resolve_worksheet_case_insensitive(spreadsheet, worksheet_name: str):
+    target_name = str(worksheet_name or "").strip()
+    if not target_name:
+        return None
+
+    try:
+        return spreadsheet.worksheet(target_name)
+    except Exception:
+        pass
+
+    normalized_target = target_name.casefold()
+    try:
+        for worksheet in spreadsheet.worksheets():
+            if str(worksheet.title).strip().casefold() == normalized_target:
+                return worksheet
+    except Exception:
+        return None
+
+    return None
+
+
 def _get_gspread_spreadsheet_strict():
     if gspread is None or Credentials is None:
         raise RuntimeError("gspread/google-auth libraries are not available.")
@@ -1197,14 +1351,7 @@ def _get_gspread_spreadsheet_strict():
         creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
 
     client = gspread.authorize(creds)
-    if sheet_name:
-        spreadsheet = client.open(sheet_name)
-    elif target.startswith("http"):
-        spreadsheet = client.open_by_url(target)
-    elif "/" not in target and len(target) >= 30:
-        spreadsheet = client.open_by_key(target)
-    else:
-        spreadsheet = client.open(target)
+    spreadsheet = _open_spreadsheet_with_fallback(client, target, sheet_name)
 
     # No-op write probe confirms write permission without changing data.
     
@@ -1231,11 +1378,7 @@ def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, 
         master_ws = spreadsheet.add_worksheet(title=WS_VENDOR_MASTER, rows="2000", cols=str(max(20, len(VENDOR_MASTER_COLUMNS) + 4)))
         master_ws.update("A1", [VENDOR_MASTER_COLUMNS])
 
-    existing_headers = [str(col).strip() for col in master_ws.row_values(1)]
-    if existing_headers != VENDOR_MASTER_COLUMNS:
-        master_ws.update("A1", [VENDOR_MASTER_COLUMNS])
-
-    master_ws.append_row([vendor.strip(), contact.strip(), address.strip()], value_input_option="USER_ENTERED")
+    _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data), contact=contact, address=address)
 
 
 def ensure_local_data_files() -> None:
@@ -1289,9 +1432,50 @@ def load_vendor_catalog() -> dict:
 
         return catalog
 
-    if using_google_sheets():
-        sheet_df = _sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
-        return _catalog_from_df(sheet_df)
+    spreadsheet = _get_gspread_spreadsheet()
+    if spreadsheet is None and has_google_service_account():
+        _get_gspread_spreadsheet.clear()
+        spreadsheet = _get_gspread_spreadsheet()
+
+    if spreadsheet is not None:
+        worksheet = _resolve_worksheet_case_insensitive(spreadsheet, WS_VENDOR)
+        catalog: dict[str, dict] = {}
+        if worksheet is not None:
+            try:
+                values = worksheet.get_all_values()
+            except Exception as exc:
+                _record_gsheets_exception(f"vendor catalog read: {WS_VENDOR}", exc)
+                values = []
+
+            if values:
+                header_map = {
+                    _normalize_sheet_header(header): idx
+                    for idx, header in enumerate(values[0])
+                    if str(header).strip()
+                }
+
+                vendor_idx = header_map.get("vendor")
+                item_idx = header_map.get("item")
+                rate_idx = header_map.get("rate")
+
+                if vendor_idx is not None and item_idx is not None and rate_idx is not None:
+                    for row in values[1:]:
+                        vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
+                        item = str(row[item_idx]).strip() if item_idx < len(row) else ""
+                        rate_value = row[rate_idx] if rate_idx < len(row) else ""
+
+                        if not vendor:
+                            continue
+
+                        catalog.setdefault(vendor, {})
+                        if item:
+                            catalog[vendor][item] = _safe_float(rate_value, 0.0)
+
+        for vendor_name in _load_vendor_names_from_master_sheet(spreadsheet):
+            catalog.setdefault(vendor_name, {})
+
+        if catalog:
+            return catalog
 
     public_df = _public_sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
     public_catalog = _catalog_from_df(public_df)
@@ -1315,6 +1499,9 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
             worksheet = _get_or_create_worksheet(WS_VENDOR, VENDOR_COLUMNS)
             if worksheet is not None:
                 _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data)
+                master_ws = _get_or_create_worksheet(WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
+                if master_ws is not None:
+                    _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data))
                 return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
         except Exception as exc:
             _record_gsheets_exception(f"vendor catalog upsert: {WS_VENDOR}", exc)
