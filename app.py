@@ -714,6 +714,7 @@ AUTH_ROLE_ADMIN = "admin"
 AUTH_ROLE_STORE_MANAGER = "store_manager"
 
 SESSION_DATA_CACHE_KEY = "_prexa_session_data_cache"
+LOCAL_OVERRIDE_STATE_KEY = "_prexa_local_override_state"
 STATUS_CACHE_TTL_SECONDS = 30
 VENDOR_CACHE_TTL_SECONDS = 20
 INWARD_CACHE_TTL_SECONDS = 20
@@ -877,6 +878,24 @@ def _set_session_cached_value(cache_key: str, value) -> None:
 
 def _clear_session_data_cache() -> None:
     st.session_state.pop(SESSION_DATA_CACHE_KEY, None)
+
+
+def _ensure_local_override_state() -> dict:
+    state = st.session_state.get(LOCAL_OVERRIDE_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {}
+        st.session_state[LOCAL_OVERRIDE_STATE_KEY] = state
+    return state
+
+
+def _set_local_override(dataset_key: str, enabled: bool) -> None:
+    state = _ensure_local_override_state()
+    state[str(dataset_key)] = bool(enabled)
+
+
+def _is_local_override_enabled(dataset_key: str) -> bool:
+    state = _ensure_local_override_state()
+    return bool(state.get(str(dataset_key), False))
 
 
 def _gsheet_target() -> str:
@@ -1113,8 +1132,8 @@ def _get_gspread_spreadsheet():
 
         spreadsheet = _open_spreadsheet_with_fallback(client, target, sheet_name)
 
-        # No-op write probe to ensure service-account write access exists.
-        spreadsheet.batch_update({"requests": []})
+        # Light connectivity probe; avoids invalid empty batch_update requests.
+        _ = spreadsheet.title
         return spreadsheet
 
     except Exception as exc:
@@ -1624,6 +1643,8 @@ def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, 
         master_ws.update("A1", [VENDOR_MASTER_COLUMNS])
 
     _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data), contact=contact, address=address)
+    _set_local_override("vendor_catalog", False)
+    _set_session_cached_value("vendor_catalog", vendor_catalog_data)
 
 
 def ensure_local_data_files() -> None:
@@ -1662,6 +1683,18 @@ def load_vendor_catalog() -> dict:
     cached_catalog = _get_session_cached_value("vendor_catalog", VENDOR_CACHE_TTL_SECONDS)
     if isinstance(cached_catalog, dict):
         return cached_catalog
+
+    if _is_local_override_enabled("vendor_catalog"):
+        if not os.path.exists(VENDOR_FILE):
+            return {}
+        try:
+            with open(VENDOR_FILE, "r") as file_handle:
+                local_data = json.load(file_handle)
+            local_result = local_data if isinstance(local_data, dict) else {}
+            _set_session_cached_value("vendor_catalog", local_result)
+            return local_result
+        except Exception:
+            return {}
 
     def _catalog_from_df(df: Optional[pd.DataFrame]) -> dict:
         normalized_df = _normalize_vendor_catalog_df(df)
@@ -1750,6 +1783,9 @@ def load_vendor_catalog() -> dict:
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
     _persist_vendor_local_backup(vendor_catalog_data, source="save_vendor_catalog")
+    _set_session_cached_value("vendor_catalog", vendor_catalog_data)
+
+    write_success = False
 
     if google_sheets_write_enabled():
         try:
@@ -1759,12 +1795,19 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
                 master_ws = _get_or_create_worksheet(WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
                 if master_ws is not None:
                     _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data))
-                return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
+                write_success = True
         except Exception as exc:
             _record_gsheets_exception(f"vendor catalog upsert: {WS_VENDOR}", exc)
 
+        if write_success:
+            _set_local_override("vendor_catalog", False)
+            return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
+
+        _set_local_override("vendor_catalog", True)
         if has_google_service_account():
             st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
+    else:
+        _set_local_override("vendor_catalog", True)
 
     details = _last_gsheets_error().strip()
     if details:
@@ -1774,12 +1817,20 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
 
 def save_payment_data(df: pd.DataFrame) -> None:
     _persist_payment_local_backup(df, source="save_payment_data")
+    _set_session_cached_value("payments_data", df)
+
+    write_success = False
 
     if google_sheets_write_enabled():
         if _write_sheet_with_retry(WS_PAYMENTS, df, PAYMENT_COLUMNS, retries=1):
+            write_success = True
+            _set_local_override("payments", False)
             return
         if has_google_service_account():
             st.warning("Google Sheets sync failed for payments. Saved locally as fallback.")
+
+    if not write_success:
+        _set_local_override("payments", True)
 
 
 def parse_optional_rate(rate_value: str) -> float:
@@ -2030,6 +2081,11 @@ def load_inward_data() -> pd.DataFrame:
     if isinstance(cached_inward, pd.DataFrame):
         return cached_inward
 
+    if _is_local_override_enabled("inward"):
+        local_df = safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
+        _set_session_cached_value("inward_data", local_df)
+        return local_df
+
     if using_google_sheets():
         df = _sheet_to_df(WS_INWARD, INWARD_COLUMNS)
         _set_session_cached_value("inward_data", df)
@@ -2047,12 +2103,20 @@ def load_inward_data() -> pd.DataFrame:
 
 def save_inward_data(df: pd.DataFrame) -> None:
     _persist_inward_local_backup(df, source="save_inward_data")
+    _set_session_cached_value("inward_data", df)
+
+    write_success = False
 
     if google_sheets_write_enabled():
         if _write_sheet_with_retry(WS_INWARD, df, INWARD_COLUMNS, retries=1):
+            write_success = True
+            _set_local_override("inward", False)
             return
         if has_google_service_account():
             st.warning("Google Sheets sync failed for inward records. Saved locally as fallback.")
+
+    if not write_success:
+        _set_local_override("inward", True)
 
 
 def update_inward_record(
@@ -2093,6 +2157,11 @@ def load_payments_data() -> pd.DataFrame:
     cached_payments = _get_session_cached_value("payments_data", PAYMENT_CACHE_TTL_SECONDS)
     if isinstance(cached_payments, pd.DataFrame):
         return cached_payments
+
+    if _is_local_override_enabled("payments"):
+        local_df = safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
+        _set_session_cached_value("payments_data", local_df)
+        return local_df
 
     if using_google_sheets():
         df = _sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
@@ -3614,11 +3683,18 @@ elif selected_page == "Vendor Directory":
                     st.warning(f"Vendor '{vendor_name}' already exists.")
                 else:
                     vendor_catalog[vendor_name] = {}
-                    save_vendor_to_google_sheets_strict(vendor_catalog, vendor_name, new_contact, new_address)
-                    st.session_state["vendor_submit_status"] = {
-                        "kind": "success",
-                        "message": f"Vendor '{vendor_name}' added successfully and synced to Google Sheets.",
-                    }
+                    try:
+                        save_vendor_to_google_sheets_strict(vendor_catalog, vendor_name, new_contact, new_address)
+                        st.session_state["vendor_submit_status"] = {
+                            "kind": "success",
+                            "message": f"Vendor '{vendor_name}' added successfully and synced to Google Sheets.",
+                        }
+                    except Exception as exc:
+                        save_vendor_catalog(vendor_catalog)
+                        st.session_state["vendor_submit_status"] = {
+                            "kind": "warning",
+                            "message": f"Vendor '{vendor_name}' saved locally; Google Sheets sync failed ({exc}).",
+                        }
                     _refresh_app_data_after_submit()
 
 # 5. ITEMS CATALOG
