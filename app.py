@@ -2,6 +2,7 @@ import io
 import json
 import os
 import sqlite3
+import traceback
 import uuid
 import zipfile
 from datetime import datetime
@@ -647,6 +648,7 @@ WS_SLIPS = "StoreSlips"
 DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/11l7bawuKdDKhZLGwzN-hxrOer5CNI2oSkJQTPIDlQLc/edit?gid=0#gid=0"
 VENDOR_MASTER_COLUMNS = ["Vendor", "Contact", "Address"]
 LOCAL_GSHEETS_CREDENTIALS = Path(__file__).resolve().with_name("credentials.json")
+LAST_GSHEETS_ERROR = ""
 
 INWARD_COLUMNS = [
     "Date",
@@ -911,6 +913,18 @@ def _safe_float(value, default=0.0) -> float:
         return default
 
 
+def _record_gsheets_exception(context: str, exc: Exception) -> str:
+    global LAST_GSHEETS_ERROR
+    trace = traceback.format_exc()
+    LAST_GSHEETS_ERROR = f"[{context}] {exc}\n{trace}"
+    print(LAST_GSHEETS_ERROR)
+    return LAST_GSHEETS_ERROR
+
+
+def _last_gsheets_error() -> str:
+    return LAST_GSHEETS_ERROR
+
+
 def _get_or_create_worksheet(name: str, headers: list[str]):
     spreadsheet = _get_gspread_spreadsheet()
     if spreadsheet is None:
@@ -918,11 +932,13 @@ def _get_or_create_worksheet(name: str, headers: list[str]):
 
     try:
         worksheet = spreadsheet.worksheet(name)
-    except Exception:
+    except Exception as exc:
+        _record_gsheets_exception(f"worksheet lookup: {name}", exc)
         try:
             worksheet = spreadsheet.add_worksheet(title=name, rows="2000", cols=str(max(20, len(headers) + 4)))
             worksheet.update("A1", [headers])
-        except Exception:
+        except Exception as add_exc:
+            _record_gsheets_exception(f"worksheet create: {name}", add_exc)
             return None
 
     return worksheet
@@ -989,7 +1005,8 @@ def _df_to_sheet(name: str, df: pd.DataFrame, headers: list[str]) -> bool:
         worksheet.clear()
         worksheet.update("A1", values)
         return True
-    except Exception:
+    except Exception as exc:
+        _record_gsheets_exception(f"sheet write: {name}", exc)
         return False
 
 
@@ -1016,13 +1033,15 @@ def _append_sheet_row(name: str, headers: list[str], row_values: list[object]) -
     if [str(col).strip() for col in existing_headers] != headers:
         try:
             worksheet.update("A1", [headers])
-        except Exception:
+        except Exception as exc:
+            _record_gsheets_exception(f"header sync: {name}", exc)
             return False, f"Worksheet '{name}' header update failed."
 
     try:
         worksheet.append_row(["" if value is None else value for value in row_values], value_input_option="USER_ENTERED")
         return True, f"Vendor saved to Google Sheets tab '{name}'."
     except Exception as exc:
+        _record_gsheets_exception(f"append row: {name}", exc)
         return False, f"Google Sheets append failed: {exc}"
 
 
@@ -1127,6 +1146,9 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
 
     with open(VENDOR_FILE, "w") as file_handle:
         json.dump(vendor_catalog_data, file_handle, indent=2)
+    details = _last_gsheets_error().strip()
+    if details:
+        return False, f"Saved locally; Google Sheets sync failed.\n{details}"
     return False, "Saved locally; Google Sheets sync was unavailable or failed."
 
 
@@ -2747,6 +2769,9 @@ elif selected_page == "Vendor Directory":
                         st.error(
                             f"Vendor submit failed for Google Sheets. {catalog_message}"
                         )
+                        trace_details = _last_gsheets_error().strip()
+                        if trace_details:
+                            st.code(trace_details, language="text")
 
 # 5. ITEMS CATALOG
 elif selected_page == "Items Catalog":
