@@ -5,6 +5,7 @@ import sqlite3
 import uuid
 import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, quote, urlparse
 
@@ -643,6 +644,7 @@ WS_INWARD = "InwardRecords"
 WS_PAYMENTS = "Payments"
 WS_SLIPS = "StoreSlips"
 DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/11l7bawuKdDKhZLGwzN-hxrOer5CNI2oSkJQTPIDlQLc/edit?gid=0#gid=0"
+LOCAL_GSHEETS_CREDENTIALS = Path(__file__).resolve().with_name("credentials.json")
 
 INWARD_COLUMNS = [
     "Date",
@@ -691,11 +693,26 @@ def _gsheet_target() -> str:
 
 
 def is_google_sheets_configured() -> bool:
-    return bool(_gsheet_target()) and bool(_secrets_section("gcp_service_account"))
+    return bool(_gsheet_target()) and (
+        LOCAL_GSHEETS_CREDENTIALS.exists() or bool(_secrets_section("gcp_service_account"))
+    )
 
 
 def has_google_service_account() -> bool:
-    return bool(_secrets_section("gcp_service_account"))
+    return LOCAL_GSHEETS_CREDENTIALS.exists() or bool(_secrets_section("gcp_service_account"))
+
+
+def _google_credentials_path() -> Optional[Path]:
+    if LOCAL_GSHEETS_CREDENTIALS.exists():
+        return LOCAL_GSHEETS_CREDENTIALS
+
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.exists():
+            return candidate
+
+    return None
 
 
 def _sheet_key_from_target(target: str) -> str:
@@ -834,14 +851,18 @@ def _get_gspread_spreadsheet():
         return None
 
     try:
-        service_account_info = _secrets_section("gcp_service_account")
-        if not service_account_info:
-            return None
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/drive",
         ]
-        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+        credentials_path = _google_credentials_path()
+        if credentials_path is not None:
+            creds = Credentials.from_service_account_file(str(credentials_path), scopes=scopes)
+        else:
+            service_account_info = _secrets_section("gcp_service_account")
+            if not service_account_info:
+                return None
+            creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         client = gspread.authorize(creds)
         if target.startswith("http"):
             return client.open_by_url(target)
