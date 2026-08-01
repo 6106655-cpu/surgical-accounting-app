@@ -6,7 +6,7 @@ import uuid
 import zipfile
 from datetime import datetime
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import pandas as pd
 import streamlit as st
@@ -632,6 +632,134 @@ def is_google_sheets_configured() -> bool:
     return bool(_gsheet_target()) and bool(_secrets_section("gcp_service_account"))
 
 
+def has_google_service_account() -> bool:
+    return bool(_secrets_section("gcp_service_account"))
+
+
+def _sheet_key_from_target(target: str) -> str:
+    value = str(target or "").strip()
+    if not value:
+        return ""
+    if value.startswith("http") and "/d/" in value:
+        try:
+            return value.split("/d/", 1)[1].split("/", 1)[0].strip()
+        except Exception:
+            return ""
+    if "/" not in value and len(value) >= 30:
+        return value
+    return ""
+
+
+def _public_sheet_key() -> str:
+    return _sheet_key_from_target(_gsheet_target())
+
+
+def _public_sheet_gid(sheet_name: str) -> Optional[str]:
+    gs = _secrets_section("gsheets")
+    gids = _secrets_section("gsheets_gids")
+
+    direct = gs.get(f"{sheet_name}_gid")
+    if direct is not None and str(direct).strip() != "":
+        return str(direct).strip()
+
+    mapped = gids.get(sheet_name)
+    if mapped is not None and str(mapped).strip() != "":
+        return str(mapped).strip()
+
+    generic = gs.get("gid")
+    if generic is not None and str(generic).strip() != "":
+        return str(generic).strip()
+
+    target = _gsheet_target()
+    if target.startswith("http"):
+        try:
+            parsed = urlparse(target)
+            parsed_gid = parse_qs(parsed.query).get("gid", [""])[0].strip()
+            if parsed_gid:
+                return parsed_gid
+        except Exception:
+            pass
+
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
+    if not sheet_key or gid is None:
+        return None
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&gid={gid}"
+    try:
+        return pd.read_csv(csv_url)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _read_public_sheet_by_name(sheet_key: str, sheet_name: str) -> Optional[pd.DataFrame]:
+    if not sheet_key or not sheet_name:
+        return None
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_key}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote(sheet_name)}"
+    )
+    try:
+        return pd.read_csv(csv_url)
+    except Exception:
+        return None
+
+
+def _public_sheet_to_df(name: str, headers: list[str]) -> Optional[pd.DataFrame]:
+    sheet_key = _public_sheet_key()
+    gid = _public_sheet_gid(name)
+    if not sheet_key:
+        return None
+
+    df = _read_public_sheet_csv(sheet_key, gid) if gid is not None else None
+    if df is None:
+        df = _read_public_sheet_by_name(sheet_key, name)
+    if df is None:
+        return None
+
+    for col in headers:
+        if col not in df.columns:
+            df[col] = ""
+
+    ordered = [col for col in headers if col in df.columns]
+    extras = [col for col in df.columns if col not in ordered]
+    return df[ordered + extras]
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _public_sheet_ping(sheet_key: str, gid: str) -> bool:
+    if not sheet_key or gid is None:
+        return False
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&gid={gid}"
+    try:
+        pd.read_csv(csv_url, nrows=1)
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(show_spinner=False, ttl=120)
+def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
+    if not sheet_key or not sheet_name:
+        return False
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_key}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote(sheet_name)}"
+    )
+    try:
+        pd.read_csv(csv_url, nrows=1)
+        return True
+    except Exception:
+        return False
+
+
+def google_sheets_write_enabled() -> bool:
+    return _get_gspread_spreadsheet() is not None
+
+
 @st.cache_resource(show_spinner=False)
 def _get_gspread_spreadsheet():
     if gspread is None or Credentials is None:
@@ -665,20 +793,28 @@ def using_google_sheets() -> bool:
 
 
 def google_sheets_status() -> tuple[bool, str]:
-    if gspread is None or Credentials is None:
-        return False, "Google Sheets package missing"
-
-    if not is_google_sheets_configured():
-        return False, "Google Sheets secrets not configured"
-
     spreadsheet = _get_gspread_spreadsheet()
-    if spreadsheet is None:
-        return False, "Connecting to Google Sheets..."
+    if spreadsheet is not None:
+        try:
+            return True, f"Connected (read/write): {spreadsheet.title}"
+        except Exception:
+            return True, "Connected (read/write) to Google Sheets"
 
-    try:
-        return True, f"Connected: {spreadsheet.title}"
-    except Exception:
-        return True, "Connected to Google Sheets"
+    sheet_key = _public_sheet_key()
+    public_gid = _public_sheet_gid(WS_INWARD)
+    if sheet_key:
+        if public_gid is not None and _public_sheet_ping(sheet_key, public_gid):
+            return True, "Connected (public read-only mode)"
+        if _public_sheet_ping_by_name(sheet_key, WS_INWARD):
+            return True, "Connected (public read-only mode)"
+
+    if has_google_service_account():
+        return False, "Service account configured, but sheet access failed. Check share permissions."
+
+    if sheet_key:
+        return False, "Public sheet configured but not accessible yet (publish/share or check gid)."
+
+    return False, "Google Sheets not configured. Running with local storage fallback."
 
 
 def _safe_float(value, default=0.0) -> float:
@@ -828,6 +964,21 @@ def load_vendor_catalog() -> dict:
                 catalog[vendor][item] = _safe_float(row.get("Rate", 0.0), 0.0)
         return catalog
 
+    public_df = _public_sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
+    if public_df is not None:
+        catalog: dict[str, dict] = {}
+        if public_df.empty:
+            return catalog
+        for _, row in public_df.iterrows():
+            vendor = str(row.get("Vendor", "")).strip()
+            item = str(row.get("Item", "")).strip()
+            if not vendor:
+                continue
+            catalog.setdefault(vendor, {})
+            if item:
+                catalog[vendor][item] = _safe_float(row.get("Rate", 0.0), 0.0)
+        return catalog
+
     if not os.path.exists(VENDOR_FILE):
         return {}
     try:
@@ -839,7 +990,7 @@ def load_vendor_catalog() -> dict:
 
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> None:
-    if is_google_sheets_configured():
+    if google_sheets_write_enabled():
         rows = []
         for vendor, items in vendor_catalog_data.items():
             if not items:
@@ -850,17 +1001,19 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> None:
         out_df = pd.DataFrame(rows, columns=VENDOR_COLUMNS)
         if _write_sheet_with_retry(WS_VENDOR, out_df, VENDOR_COLUMNS, retries=1):
             return
-        st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
+        if has_google_service_account():
+            st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
 
     with open(VENDOR_FILE, "w") as file_handle:
         json.dump(vendor_catalog_data, file_handle, indent=2)
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
-    if is_google_sheets_configured():
+    if google_sheets_write_enabled():
         if _write_sheet_with_retry(WS_PAYMENTS, df, PAYMENT_COLUMNS, retries=1):
             return
-        st.warning("Google Sheets sync failed for payments. Saved locally as fallback.")
+        if has_google_service_account():
+            st.warning("Google Sheets sync failed for payments. Saved locally as fallback.")
     df.to_csv(PAYMENT_FILE, index=False)
 
 
@@ -928,14 +1081,20 @@ def append_inward_record(
 def load_inward_data() -> pd.DataFrame:
     if using_google_sheets():
         return _sheet_to_df(WS_INWARD, INWARD_COLUMNS)
+
+    public_df = _public_sheet_to_df(WS_INWARD, INWARD_COLUMNS)
+    if public_df is not None:
+        return public_df
+
     return safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
 
 
 def save_inward_data(df: pd.DataFrame) -> None:
-    if is_google_sheets_configured():
+    if google_sheets_write_enabled():
         if _write_sheet_with_retry(WS_INWARD, df, INWARD_COLUMNS, retries=1):
             return
-        st.warning("Google Sheets sync failed for inward records. Saved locally as fallback.")
+        if has_google_service_account():
+            st.warning("Google Sheets sync failed for inward records. Saved locally as fallback.")
     df.to_csv(INWARD_FILE, index=False)
 
 
@@ -976,6 +1135,11 @@ def delete_inward_record(row_id: int) -> None:
 def load_payments_data() -> pd.DataFrame:
     if using_google_sheets():
         return _sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
+
+    public_df = _public_sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
+    if public_df is not None:
+        return public_df
+
     return safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
 
 
@@ -1019,7 +1183,7 @@ def delete_payment_record(row_id: int) -> None:
 
 
 def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, filename: str, created_at: str) -> None:
-    if is_google_sheets_configured():
+    if google_sheets_write_enabled():
         slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
         new_row = {
             "slip_code": slip_code,
@@ -1032,7 +1196,8 @@ def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, fi
         slips_df = pd.concat([slips_df, pd.DataFrame([new_row])], ignore_index=True)
         if _write_sheet_with_retry(WS_SLIPS, slips_df, SLIP_COLUMNS, retries=1):
             return
-        st.warning("Google Sheets sync failed for store slip. Saved locally as fallback.")
+        if has_google_service_account():
+            st.warning("Google Sheets sync failed for store slip. Saved locally as fallback.")
 
     save_slip_record(vendor, item, int(quantity), slip_code, filename)
 
@@ -1043,6 +1208,23 @@ def get_recent_slips_store(limit: int = 8):
         if slips_df.empty:
             return []
         slips_df = slips_df.copy()
+        slips_df["_created_sort"] = pd.to_datetime(slips_df["created_at"], errors="coerce")
+        slips_df = slips_df.sort_values("_created_sort", ascending=False).drop(columns=["_created_sort"])
+        records = []
+        for _, row in slips_df.head(limit).iterrows():
+            records.append((
+                str(row.get("slip_code", "")),
+                str(row.get("vendor", "")),
+                str(row.get("item", "")),
+                int(_safe_float(row.get("quantity", 0), 0)),
+                str(row.get("created_at", "")),
+                str(row.get("filename", "")),
+            ))
+        return records
+
+    public_df = _public_sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
+    if public_df is not None and not public_df.empty:
+        slips_df = public_df.copy()
         slips_df["_created_sort"] = pd.to_datetime(slips_df["created_at"], errors="coerce")
         slips_df = slips_df.sort_values("_created_sort", ascending=False).drop(columns=["_created_sort"])
         records = []
@@ -1078,6 +1260,17 @@ def lookup_slip_by_barcode(code: str) -> Optional[dict]:
             "Item": str(row.get("item", "")),
             "Quantity": int(_safe_float(row.get("quantity", 0), 0)),
         }
+
+    public_df = _public_sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
+    if public_df is not None and not public_df.empty:
+        match = public_df[public_df["slip_code"].astype(str).str.strip() == code]
+        if not match.empty:
+            row = match.iloc[-1]
+            return {
+                "Vendor": str(row.get("vendor", "")),
+                "Item": str(row.get("item", "")),
+                "Quantity": int(_safe_float(row.get("quantity", 0), 0)),
+            }
 
     barcode_db = "slip_records.db"
     if not os.path.exists(barcode_db):
@@ -1427,13 +1620,17 @@ with st.sidebar:
     gs_connected, gs_status_text = google_sheets_status()
     if st.button("Refresh Google Sheets connection", use_container_width=True):
         _get_gspread_spreadsheet.clear()
+        _public_sheet_ping.clear()
+        _public_sheet_ping_by_name.clear()
+        _read_public_sheet_csv.clear()
+        _read_public_sheet_by_name.clear()
         st.rerun()
 
     if gs_connected:
         st.success("Google Sheets backup: Active")
         st.caption(gs_status_text)
     else:
-        st.warning("Google Sheets backup: Offline")
+        st.info("Google Sheets backup: Local fallback mode")
         st.caption(gs_status_text)
 
     if is_admin and st.button("📦 Export Local Backup", use_container_width=True):
