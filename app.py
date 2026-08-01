@@ -47,6 +47,10 @@ st.markdown("""
         --prexa-text-strong: #000000;
         --prexa-text-muted: #000000;
         --prexa-border: rgba(29, 53, 87, 0.22);
+        --prexa-body-size: 18px;
+        --prexa-caption-size: 15px;
+        --prexa-label-size: 16px;
+        --prexa-card-text-size: 17px;
     }
     html, body, .stApp {
         background: var(--prexa-bg) !important;
@@ -58,6 +62,8 @@ st.markdown("""
         margin: 0 !important;
         padding: 0 !important;
         min-height: 100%;
+        font-size: var(--prexa-body-size);
+        line-height: 1.55;
     }
     [data-testid="stAppViewContainer"],
     [data-testid="stAppViewContainer"] .main,
@@ -103,6 +109,37 @@ st.markdown("""
     [data-testid="stAppViewContainer"] .main [data-testid="stWidgetLabel"] {
         color: var(--prexa-text-strong) !important;
         -webkit-text-fill-color: var(--prexa-text-strong) !important;
+    }
+    [data-testid="stAppViewContainer"] .main p,
+    [data-testid="stAppViewContainer"] .main li,
+    [data-testid="stAppViewContainer"] .main td,
+    [data-testid="stAppViewContainer"] .main th,
+    [data-testid="stAppViewContainer"] .main span,
+    [data-testid="stAppViewContainer"] .main div,
+    [data-testid="stAppViewContainer"] .main small,
+    [data-testid="stAppViewContainer"] .main .stCaption,
+    [data-testid="stAppViewContainer"] .main [data-testid="stCaptionContainer"],
+    [data-testid="stAppViewContainer"] .main label,
+    [data-testid="stAppViewContainer"] .main [data-testid="stWidgetLabel"],
+    [data-testid="stAppViewContainer"] .main [data-baseweb="input"] input,
+    [data-testid="stAppViewContainer"] .main [data-baseweb="textarea"] textarea,
+    [data-testid="stAppViewContainer"] .main [role="combobox"],
+    [data-testid="stAppViewContainer"] .main [role="option"] {
+        font-size: var(--prexa-body-size) !important;
+        line-height: 1.55 !important;
+    }
+    [data-testid="stAppViewContainer"] .main .stCaption,
+    [data-testid="stAppViewContainer"] .main [data-testid="stCaptionContainer"],
+    [data-testid="stAppViewContainer"] .main small {
+        font-size: var(--prexa-caption-size) !important;
+        line-height: 1.45 !important;
+    }
+    [data-testid="stAppViewContainer"] .main label,
+    [data-testid="stAppViewContainer"] .main [data-testid="stWidgetLabel"],
+    [data-testid="stAppViewContainer"] .main [data-testid="stMarkdownContainer"] label {
+        font-size: var(--prexa-label-size) !important;
+        line-height: 1.35 !important;
+        font-weight: 600 !important;
     }
     [data-testid="stAppViewContainer"] .main input,
     [data-testid="stAppViewContainer"] .main textarea,
@@ -205,6 +242,10 @@ st.markdown("""
         padding: 16px;
         margin-bottom: 16px;
     }
+    .panel-card *, .kpi-group *, .kpi-card *, .ledger-card * {
+        font-size: var(--prexa-card-text-size) !important;
+        line-height: 1.55 !important;
+    }
     .panel-card {
         padding: 16px;
     }
@@ -248,6 +289,27 @@ st.markdown("""
         font-weight: 800;
         color: var(--prexa-text-strong);
         margin: 0;
+
+    @media (max-width: 768px) {
+        :root {
+            --prexa-body-size: 17px;
+            --prexa-caption-size: 14px;
+            --prexa-label-size: 15px;
+            --prexa-card-text-size: 16px;
+        }
+        .company-title {
+            font-size: 28px;
+        }
+        .sidebar-brand {
+            font-size: 18px;
+        }
+        .sidebar-header {
+            font-size: 15px;
+        }
+        .panel-title {
+            font-size: 18px;
+        }
+    }
     }
     .kpi-card.warning {
         border-color: rgba(245, 158, 11, 0.22);
