@@ -1057,6 +1057,73 @@ def google_sheets_write_enabled() -> bool:
     return _get_gspread_spreadsheet() is not None
 
 
+def _has_non_empty_sheet_values(values) -> bool:
+    if values is None:
+        return False
+    if not isinstance(values, list):
+        return True
+    if len(values) == 0:
+        return False
+
+    for row in values:
+        if isinstance(row, list):
+            if any(str(cell).strip() != "" for cell in row):
+                return True
+        elif str(row).strip() != "":
+            return True
+    return False
+
+
+def _safe_batch_update(spreadsheet, body: dict, context: str) -> bool:
+    requests = body.get("requests") if isinstance(body, dict) else None
+    if requests is not None and isinstance(requests, list) and len(requests) == 0:
+        return True
+    if not isinstance(body, dict) or len(body) == 0:
+        return True
+
+    try:
+        spreadsheet.batch_update(body)
+        return True
+    except Exception as exc:
+        _record_gsheets_exception(context, exc)
+        return False
+
+
+def _safe_worksheet_update(
+    worksheet,
+    cell_range: str,
+    values,
+    *,
+    context: str,
+    value_input_option: Optional[str] = None,
+) -> bool:
+    if not _has_non_empty_sheet_values(values):
+        return True
+
+    try:
+        if value_input_option:
+            worksheet.update(cell_range, values, value_input_option=value_input_option)
+        else:
+            worksheet.update(cell_range, values)
+        return True
+    except Exception as exc:
+        _record_gsheets_exception(context, exc)
+        return False
+
+
+def _safe_append_row(worksheet, row_values: list[object], *, context: str, value_input_option: str = "USER_ENTERED") -> bool:
+    normalized = ["" if value is None else value for value in row_values]
+    if all(str(value).strip() == "" for value in normalized):
+        return True
+
+    try:
+        worksheet.append_row(normalized, value_input_option=value_input_option)
+        return True
+    except Exception as exc:
+        _record_gsheets_exception(context, exc)
+        return False
+
+
 def _refresh_app_data_after_submit() -> None:
     _clear_session_data_cache()
     _get_gspread_spreadsheet.clear()
@@ -1269,7 +1336,7 @@ def _get_or_create_worksheet(name: str, headers: list[str]):
         _record_gsheets_exception(f"worksheet lookup: {name}", exc)
         try:
             worksheet = spreadsheet.add_worksheet(title=name, rows="2000", cols=str(max(20, len(headers) + 4)))
-            worksheet.update("A1", [headers])
+            _safe_worksheet_update(worksheet, "A1", [headers], context=f"worksheet create header: {name}")
         except Exception as add_exc:
             _record_gsheets_exception(f"worksheet create: {name}", add_exc)
             return None
@@ -1289,7 +1356,7 @@ def _sheet_to_df(name: str, headers: list[str]) -> pd.DataFrame:
 
     if not values:
         try:
-            worksheet.update("A1", [headers])
+            _safe_worksheet_update(worksheet, "A1", [headers], context=f"sheet init header: {name}")
         except Exception:
             pass
         return pd.DataFrame(columns=headers)
@@ -1297,7 +1364,7 @@ def _sheet_to_df(name: str, headers: list[str]) -> pd.DataFrame:
     sheet_headers = [str(col).strip() for col in values[0]]
     if not any(sheet_headers):
         try:
-            worksheet.update("A1", [headers])
+            _safe_worksheet_update(worksheet, "A1", [headers], context=f"sheet reset header: {name}")
         except Exception:
             pass
         return pd.DataFrame(columns=headers)
@@ -1336,7 +1403,8 @@ def _df_to_sheet(name: str, df: pd.DataFrame, headers: list[str]) -> bool:
 
     try:
         worksheet.clear()
-        worksheet.update("A1", values)
+        if not _safe_worksheet_update(worksheet, "A1", values, context=f"sheet write: {name}"):
+            return False
         return True
     except Exception as exc:
         _record_gsheets_exception(f"sheet write: {name}", exc)
@@ -1365,13 +1433,15 @@ def _append_sheet_row(name: str, headers: list[str], row_values: list[object]) -
 
     if [str(col).strip() for col in existing_headers] != headers:
         try:
-            worksheet.update("A1", [headers])
+            if not _safe_worksheet_update(worksheet, "A1", [headers], context=f"header sync: {name}"):
+                return False, f"Worksheet '{name}' header update failed."
         except Exception as exc:
             _record_gsheets_exception(f"header sync: {name}", exc)
             return False, f"Worksheet '{name}' header update failed."
 
     try:
-        worksheet.append_row(["" if value is None else value for value in row_values], value_input_option="USER_ENTERED")
+        if not _safe_append_row(worksheet, row_values, context=f"append row: {name}", value_input_option="USER_ENTERED"):
+            return False, "Google Sheets append failed."
         return True, f"Vendor saved to Google Sheets tab '{name}'."
     except Exception as exc:
         _record_gsheets_exception(f"append row: {name}", exc)
@@ -1449,13 +1519,13 @@ def _vendor_names_from_catalog(vendor_catalog_data: dict) -> list[str]:
 def _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data: dict) -> None:
     existing_values = worksheet.get_all_values()
     if not existing_values:
-        worksheet.update("A1", [VENDOR_COLUMNS])
+        _safe_worksheet_update(worksheet, "A1", [VENDOR_COLUMNS], context="vendor catalog header init")
         existing_values = [VENDOR_COLUMNS]
 
     raw_header = [str(col).strip() for col in existing_values[0]]
     header_lower = [col.lower() for col in raw_header]
     if not {"vendor", "item", "rate"}.issubset(set(header_lower)):
-        worksheet.update("A1:C1", [VENDOR_COLUMNS])
+        _safe_worksheet_update(worksheet, "A1:C1", [VENDOR_COLUMNS], context="vendor catalog header reset")
         raw_header = VENDOR_COLUMNS
         header_lower = ["vendor", "item", "rate"]
 
@@ -1476,13 +1546,15 @@ def _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data: dict) -> None:
         payload = [vendor, item, rate]
         if key in existing_row_by_key:
             row_number = existing_row_by_key[key]
-            worksheet.update(
+            _safe_worksheet_update(
+                worksheet,
                 f"A{row_number}:C{row_number}",
                 [payload],
+                context="vendor catalog row update",
                 value_input_option="USER_ENTERED",
             )
         else:
-            worksheet.append_row(payload, value_input_option="USER_ENTERED")
+            _safe_append_row(worksheet, payload, context="vendor catalog row append", value_input_option="USER_ENTERED")
 
 
 def _normalize_sheet_header(value: object) -> str:
@@ -1502,7 +1574,7 @@ def _upsert_vendor_master_sheet(
 
     values = worksheet.get_all_values()
     if not values:
-        worksheet.update("A1", [VENDOR_MASTER_COLUMNS])
+        _safe_worksheet_update(worksheet, "A1", [VENDOR_MASTER_COLUMNS], context="vendor master header init")
         values = [VENDOR_MASTER_COLUMNS]
 
     raw_header = [str(col).strip() for col in values[0]]
@@ -1512,7 +1584,7 @@ def _upsert_vendor_master_sheet(
     address_idx = header_map.get("address")
 
     if vendor_idx is None:
-        worksheet.update("A1:C1", [VENDOR_MASTER_COLUMNS])
+        _safe_worksheet_update(worksheet, "A1:C1", [VENDOR_MASTER_COLUMNS], context="vendor master header reset")
         raw_header = VENDOR_MASTER_COLUMNS
         vendor_idx, contact_idx, address_idx = 0, 1, 2
 
@@ -1528,13 +1600,15 @@ def _upsert_vendor_master_sheet(
         if key in existing_row_by_vendor:
             row_number = existing_row_by_vendor[key]
             if contact.strip() or address.strip():
-                worksheet.update(
+                _safe_worksheet_update(
+                    worksheet,
                     f"A{row_number}:C{row_number}",
                     [row_payload],
+                    context="vendor master row update",
                     value_input_option="USER_ENTERED",
                 )
         else:
-            worksheet.append_row(row_payload, value_input_option="USER_ENTERED")
+            _safe_append_row(worksheet, row_payload, context="vendor master row append", value_input_option="USER_ENTERED")
 
 
 def _load_vendor_names_from_master_sheet(spreadsheet) -> list[str]:
@@ -1640,7 +1714,7 @@ def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, 
         master_ws = spreadsheet.worksheet(WS_VENDOR_MASTER)
     except Exception:
         master_ws = spreadsheet.add_worksheet(title=WS_VENDOR_MASTER, rows="2000", cols=str(max(20, len(VENDOR_MASTER_COLUMNS) + 4)))
-        master_ws.update("A1", [VENDOR_MASTER_COLUMNS])
+        _safe_worksheet_update(master_ws, "A1", [VENDOR_MASTER_COLUMNS], context="vendor master strict create header")
 
     _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data), contact=contact, address=address)
     _set_local_override("vendor_catalog", False)
