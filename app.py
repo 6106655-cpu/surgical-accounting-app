@@ -1,4 +1,5 @@
 import io
+import importlib
 import json
 import os
 import sqlite3
@@ -36,6 +37,25 @@ try:
     FPDF_AVAILABLE = True
 except ImportError:
     FPDF_AVAILABLE = False
+
+try:
+    code128 = importlib.import_module("reportlab.graphics.barcode.code128")
+    colors = importlib.import_module("reportlab.lib.colors")
+    A5 = importlib.import_module("reportlab.lib.pagesizes").A5
+    reportlab_styles = importlib.import_module("reportlab.lib.styles")
+    ParagraphStyle = reportlab_styles.ParagraphStyle
+    getSampleStyleSheet = reportlab_styles.getSampleStyleSheet
+    inch = importlib.import_module("reportlab.lib.units").inch
+    reportlab_platypus = importlib.import_module("reportlab.platypus")
+    HRFlowable = reportlab_platypus.HRFlowable
+    Paragraph = reportlab_platypus.Paragraph
+    SimpleDocTemplate = reportlab_platypus.SimpleDocTemplate
+    Spacer = reportlab_platypus.Spacer
+    Table = reportlab_platypus.Table
+    TableStyle = reportlab_platypus.TableStyle
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 # Page Configuration
 st.set_page_config(page_title="Prexa Industries - ERP", layout="wide", initial_sidebar_state="expanded")
@@ -683,6 +703,9 @@ ADMIN_PAGES = [
     "Reports",
 ]
 
+AUTH_ROLE_ADMIN = "admin"
+AUTH_ROLE_STORE_MANAGER = "store_manager"
+
 
 def _secrets_section(name: str) -> dict:
     try:
@@ -773,6 +796,7 @@ def _public_sheet_gid(sheet_name: str) -> Optional[str]:
     return "0"
 
 
+@st.cache_data(show_spinner=False, ttl=120)
 def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
     if not sheet_key or gid is None:
         return None
@@ -795,6 +819,7 @@ def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
     return None
 
 
+@st.cache_data(show_spinner=False, ttl=120)
 def _read_public_sheet_by_name(sheet_key: str, sheet_name: str) -> Optional[pd.DataFrame]:
     if not sheet_key or not sheet_name:
         return None
@@ -831,12 +856,14 @@ def _public_sheet_to_df(name: str, headers: list[str]) -> Optional[pd.DataFrame]
     return df[ordered + extras]
 
 
+@st.cache_data(show_spinner=False, ttl=120)
 def _public_sheet_ping(sheet_key: str, gid: str) -> bool:
     if not sheet_key or gid is None:
         return False
     return _read_public_sheet_csv(sheet_key, gid) is not None
 
 
+@st.cache_data(show_spinner=False, ttl=120)
 def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
     if not sheet_key or not sheet_name:
         return False
@@ -845,12 +872,6 @@ def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
 
 def google_sheets_write_enabled() -> bool:
     return _get_gspread_spreadsheet() is not None
-
-
-def _clear_optional_cache(func) -> None:
-    clear_func = getattr(func, "clear", None)
-    if callable(clear_func):
-        clear_func()
 
 
 def _open_spreadsheet_with_fallback(client, target: str, sheet_name: str):
@@ -933,12 +954,6 @@ def _get_gspread_spreadsheet():
         return None
 
 
-def _get_gspread_spreadsheet_live():
-    # Force a fresh connection so Google Sheets updates are visible on each rerun.
-    _clear_optional_cache(_get_gspread_spreadsheet)
-    return _get_gspread_spreadsheet()
-
-
 def using_google_sheets() -> bool:
     spreadsheet = _get_gspread_spreadsheet()
     if spreadsheet is not None:
@@ -946,7 +961,7 @@ def using_google_sheets() -> bool:
 
     # Recover from a stale cached failure in long-running Streamlit sessions.
     if has_google_service_account():
-        _clear_optional_cache(_get_gspread_spreadsheet)
+        _get_gspread_spreadsheet.clear()
         return _get_gspread_spreadsheet() is not None
 
     return False
@@ -977,6 +992,36 @@ def google_sheets_status() -> tuple[bool, str]:
     return False, "Google Sheets not configured. Running with local storage fallback."
 
 
+def _admin_pin_value() -> str:
+    auth_section = _secrets_section("auth")
+    return str(
+        auth_section.get("admin_pin")
+        or os.environ.get("PREXA_ADMIN_PIN")
+        or DEFAULT_ADMIN_PIN
+    ).strip()
+
+
+def _initialize_auth_session() -> None:
+    st.session_state.setdefault("authenticated_role", "")
+    st.session_state.setdefault("app_selected_page", "Factory Store Slip")
+
+
+def _current_authenticated_role() -> str:
+    return str(st.session_state.get("authenticated_role", "")).strip()
+
+
+def _set_authenticated_role(role: str) -> None:
+    st.session_state.authenticated_role = role
+    st.session_state.app_selected_page = "Factory Store Slip"
+    st.session_state.pop("admin_pin_input", None)
+
+
+def _logout_current_user() -> None:
+    st.session_state.authenticated_role = ""
+    st.session_state.app_selected_page = "Factory Store Slip"
+    st.session_state.pop("admin_pin_input", None)
+
+
 def _safe_float(value, default=0.0) -> float:
     try:
         return float(value)
@@ -1005,10 +1050,6 @@ def _service_account_email_from_info(info: dict) -> str:
 
 def _get_or_create_worksheet(name: str, headers: list[str]):
     spreadsheet = _get_gspread_spreadsheet()
-    return _get_or_create_worksheet_from_spreadsheet(spreadsheet, name, headers)
-
-
-def _get_or_create_worksheet_from_spreadsheet(spreadsheet, name: str, headers: list[str]):
     if spreadsheet is None:
         return None
 
@@ -1098,7 +1139,7 @@ def _write_sheet_with_retry(name: str, df: pd.DataFrame, headers: list[str], ret
         if _df_to_sheet(name, df, headers):
             return True
         if attempt < attempts - 1:
-            _clear_optional_cache(_get_gspread_spreadsheet)
+            _get_gspread_spreadsheet.clear()
     return False
 
 
@@ -1444,9 +1485,10 @@ def load_vendor_catalog() -> dict:
 
         return catalog
 
-    spreadsheet = _get_gspread_spreadsheet_live()
+    spreadsheet = _get_gspread_spreadsheet()
     if spreadsheet is None and has_google_service_account():
-        spreadsheet = _get_gspread_spreadsheet_live()
+        _get_gspread_spreadsheet.clear()
+        spreadsheet = _get_gspread_spreadsheet()
 
     if spreadsheet is not None:
         worksheet = _resolve_worksheet_case_insensitive(spreadsheet, WS_VENDOR)
@@ -1505,13 +1547,12 @@ def load_vendor_catalog() -> dict:
 
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
-    spreadsheet = _get_gspread_spreadsheet_live()
-    if spreadsheet is not None:
+    if google_sheets_write_enabled():
         try:
-            worksheet = _get_or_create_worksheet_from_spreadsheet(spreadsheet, WS_VENDOR, VENDOR_COLUMNS)
+            worksheet = _get_or_create_worksheet(WS_VENDOR, VENDOR_COLUMNS)
             if worksheet is not None:
                 _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data)
-                master_ws = _get_or_create_worksheet_from_spreadsheet(spreadsheet, WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
+                master_ws = _get_or_create_worksheet(WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
                 if master_ws is not None:
                     _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data))
                 return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
@@ -1527,40 +1568,6 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
     if details:
         return False, f"Saved locally; Google Sheets sync failed.\n{details}"
     return False, "Saved locally; Google Sheets sync was unavailable or failed."
-
-
-def _fresh_vendor_catalog_for_ui() -> dict:
-    """Return a normalized, live vendor catalog for frontend widgets."""
-    source = load_vendor_catalog()
-    if not isinstance(source, dict):
-        return {}
-
-    normalized: dict[str, dict] = {}
-    vendor_key_to_name: dict[str, str] = {}
-
-    for raw_vendor, raw_items in source.items():
-        vendor_name = " ".join(str(raw_vendor).strip().split())
-        if not vendor_name:
-            continue
-
-        vendor_key = vendor_name.casefold()
-        canonical_name = vendor_key_to_name.get(vendor_key)
-        if canonical_name is None:
-            vendor_key_to_name[vendor_key] = vendor_name
-            canonical_name = vendor_name
-            normalized[canonical_name] = {}
-
-        item_bucket = normalized.setdefault(canonical_name, {})
-        if not isinstance(raw_items, dict):
-            continue
-
-        for raw_item, raw_rate in raw_items.items():
-            item_name = " ".join(str(raw_item).strip().split())
-            if not item_name:
-                continue
-            item_bucket[item_name] = _safe_float(raw_rate, 0.0)
-
-    return normalized
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
@@ -1593,6 +1600,188 @@ def build_print_view_data_uri(print_html: str) -> str:
     if not print_html:
         return ""
     return f"data:text/html;charset=utf-8,{quote(print_html)}"
+
+
+def generate_store_slip_code() -> str:
+    return uuid.uuid4().hex[:12].upper()
+
+
+def create_store_slip_pdf(vendor_name: str, item_name: str, quantity: int) -> tuple[bytes, str, str]:
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("reportlab is not installed.")
+
+    slip_code = generate_store_slip_code()
+    created_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A5,
+        leftMargin=0.4 * inch,
+        rightMargin=0.4 * inch,
+        topMargin=0.4 * inch,
+        bottomMargin=0.4 * inch,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "SlipTitle",
+        parent=styles["Heading1"],
+        fontName="Helvetica-Bold",
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#111827"),
+    )
+    subtitle_style = ParagraphStyle(
+        "SlipSubtitle",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=11,
+        leading=15,
+        textColor=colors.HexColor("#4B5563"),
+    )
+    label_style = ParagraphStyle(
+        "SlipLabel",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=11,
+        leading=16,
+        textColor=colors.HexColor("#1F2937"),
+    )
+    value_style = ParagraphStyle(
+        "SlipValue",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=11,
+        leading=16,
+        textColor=colors.HexColor("#111827"),
+    )
+
+    elements = [
+        Paragraph("PREXA INDUSTRIES", title_style),
+        Paragraph("Factory Store Slip (A5 PDF)", subtitle_style),
+        Spacer(1, 10),
+        HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#111827"), spaceAfter=15),
+    ]
+
+    table_data = [
+        [Paragraph("Vendor:", label_style), Paragraph(vendor_name, value_style)],
+        [Paragraph("Item:", label_style), Paragraph(item_name, value_style)],
+        [Paragraph("Quantity:", label_style), Paragraph(str(quantity), value_style)],
+        [Paragraph("Slip Code:", label_style), Paragraph(slip_code, value_style)],
+        [Paragraph("Created Time:", label_style), Paragraph(created_time, value_style)],
+    ]
+    details_table = Table(table_data, colWidths=[1.8 * inch, 3.2 * inch])
+    details_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    elements.append(details_table)
+    elements.append(Spacer(1, 20))
+
+    elements.append(code128.Code128(slip_code, barWidth=1.5, barHeight=45))
+    elements.append(Spacer(1, 25))
+
+    signature_table = Table(
+        [
+            [Paragraph("____________________", value_style), Paragraph("____________________", value_style)],
+            [Paragraph("Store Manager", label_style), Paragraph("Receiver", label_style)],
+        ],
+        colWidths=[2.5 * inch, 2.5 * inch],
+    )
+    signature_table.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
+    elements.append(signature_table)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer.read(), slip_code, created_time
+
+
+def render_store_manager_portal(vendor_catalog_data: dict) -> None:
+    st.markdown("<div class='store-slip-shell'>", unsafe_allow_html=True)
+    st.subheader("Store slip portal")
+    st.caption("Store manager access is limited to store slip generation only.")
+
+    if not REPORTLAB_AVAILABLE:
+        st.error("ReportLab is required for PDF store slips. Add `reportlab` to the environment and restart the app.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    if not vendor_catalog_data:
+        st.warning("No vendors are available in the catalog. Ask an admin to configure vendors and items first.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    vendor_options = sorted(vendor_catalog_data.keys())
+    with st.container(border=True):
+        st.markdown("### Generate store slip PDF")
+        with st.form("store_manager_slip_form", clear_on_submit=False):
+            selected_vendor = st.selectbox("Vendor", options=vendor_options, key="store_manager_vendor_select")
+            vendor_items = sorted(vendor_catalog_data.get(selected_vendor, {}).keys())
+            selected_item = st.selectbox(
+                "Item",
+                options=vendor_items if vendor_items else ["No items available"],
+                key="store_manager_item_select",
+            )
+            quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="store_manager_quantity_input")
+            generate_pdf = st.form_submit_button("Generate store slip PDF")
+
+        if generate_pdf:
+            if not vendor_items or selected_item == "No items available":
+                st.error("The selected vendor has no configured items.")
+            else:
+                normalized_item = to_strict_title_case(selected_item)
+                pdf_bytes, slip_code, created_time = create_store_slip_pdf(selected_vendor, normalized_item, int(quantity))
+                os.makedirs("slips", exist_ok=True)
+                pdf_path = os.path.join("slips", f"slip_{slip_code}.pdf")
+                with open(pdf_path, "wb") as pdf_file:
+                    pdf_file.write(pdf_bytes)
+
+                append_slip_record(selected_vendor, normalized_item, int(quantity), slip_code, pdf_path, created_time)
+                st.session_state.store_manager_last_slip = {
+                    "pdf_bytes": pdf_bytes,
+                    "slip_code": slip_code,
+                    "created_time": created_time,
+                    "vendor": selected_vendor,
+                    "item": normalized_item,
+                    "quantity": int(quantity),
+                }
+                st.success(f"Store slip {slip_code} generated successfully.")
+
+    last_slip = st.session_state.get("store_manager_last_slip")
+    if isinstance(last_slip, dict) and last_slip.get("pdf_bytes"):
+        with st.container(border=True):
+            st.markdown("### Latest generated slip")
+            st.text_input("Slip code", value=str(last_slip.get("slip_code", "")), disabled=True, key="store_manager_last_slip_code")
+            st.text_input("Created time", value=str(last_slip.get("created_time", "")), disabled=True, key="store_manager_last_created_time")
+            st.text_input("Vendor", value=str(last_slip.get("vendor", "")), disabled=True, key="store_manager_last_vendor")
+            st.text_input("Item", value=str(last_slip.get("item", "")), disabled=True, key="store_manager_last_item")
+            st.text_input("Quantity", value=str(last_slip.get("quantity", "")), disabled=True, key="store_manager_last_quantity")
+            st.download_button(
+                "Download / print store slip PDF",
+                data=last_slip["pdf_bytes"],
+                file_name=f"slip_{last_slip['slip_code']}.pdf",
+                mime="application/pdf",
+                key="store_manager_download_slip_pdf",
+            )
+
+    recent_slips = get_recent_slips_store(8)
+    with st.container(border=True):
+        st.subheader("Recent slips")
+        if recent_slips:
+            render_controlled_table(
+                pd.DataFrame([
+                    {
+                        "Slip Code": row[0],
+                        "Vendor": row[1],
+                        "Item": row[2],
+                        "Qty": row[3],
+                        "Created": row[4],
+                    }
+                    for row in recent_slips
+                ]),
+                show_index=False,
+            )
+        else:
+            st.info("No slips generated yet.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_controlled_table(df: pd.DataFrame, *, show_index: bool = False, max_height: Optional[int] = None) -> None:
@@ -2095,117 +2284,143 @@ def aggregate_bill_rows(bills_df: pd.DataFrame) -> pd.DataFrame:
 
 
 ensure_local_data_files()
+_initialize_auth_session()
 if not using_google_sheets():
     init_slip_db()
-vendor_catalog = _fresh_vendor_catalog_for_ui()
+
+selected_page = "Factory Store Slip"
+is_admin = False
 
 # Sidebar Navigation
 with st.sidebar:
     st.markdown("<div class='sidebar-brand'>PREXA INDUSTRIES</div>", unsafe_allow_html=True)
     st.markdown("<div class='sidebar-divider'></div>", unsafe_allow_html=True)
-    st.markdown("<div class='sidebar-header'>🏢 MAIN SYSTEM MENU</div>", unsafe_allow_html=True)
-    st.session_state.setdefault("app_selected_page", "Factory Store Slip")
+    authenticated_role = _current_authenticated_role()
+    if not authenticated_role:
+        st.markdown("<div class='sidebar-header'>🔐 SECURE LOGIN</div>", unsafe_allow_html=True)
+        login_role = st.radio(
+            "Access level",
+            options=["Store Manager", "Admin"],
+            index=0,
+            key="login_role_selector",
+        )
 
-    role_choice = st.radio(
-        "Access role",
-        options=["Store Staff", "Admin / Director"],
-        index=0,
-        key="access_role_selector",
-    )
-
-    admin_pin = DEFAULT_ADMIN_PIN
-    is_admin = False
-    if role_choice == "Admin / Director":
-        entered_admin_pin = st.text_input("Admin PIN", type="password", key="admin_pin_input")
-        if entered_admin_pin and entered_admin_pin == admin_pin:
-            is_admin = True
-        elif entered_admin_pin:
-            st.error("Invalid admin PIN.")
+        if login_role == "Admin":
+            entered_admin_pin = st.text_input("Admin PIN", type="password", key="admin_pin_input")
+            if st.button("Login as admin"):
+                if entered_admin_pin and entered_admin_pin == _admin_pin_value():
+                    _set_authenticated_role(AUTH_ROLE_ADMIN)
+                    st.rerun()
+                else:
+                    st.error("Invalid admin PIN.")
         else:
-            st.info("Enter admin PIN to unlock director view.")
+            st.caption("Store Manager access only opens the store slip portal.")
+            if st.button("Enter store slip portal"):
+                _set_authenticated_role(AUTH_ROLE_STORE_MANAGER)
+                st.rerun()
 
-    menu_pages = ADMIN_PAGES if is_admin else STORE_STAFF_PAGES
-    icon_map = {
-        "Dashboard": "speedometer2",
-        "Factory Store Slip": "upc-scan",
-        "Payments & Voucher": "receipt",
-        "Vendor Bills": "journal-check",
-        "Vendor Ledger": "journal-text",
-        "Vendor Directory": "people-fill",
-        "Items Catalog": "tags-fill",
-        "Reports": "bar-chart-line",
-    }
-    menu_icons = [icon_map.get(page, "circle") for page in menu_pages]
+        st.caption("Admin access unlocks financial dashboards, ledgers, payments, vendors, and reports.")
+    else:
+        is_admin = authenticated_role == AUTH_ROLE_ADMIN
+        role_label = "Admin" if is_admin else "Store Manager"
+        st.markdown(f"<div class='sidebar-header'>{role_label} Session</div>", unsafe_allow_html=True)
 
-    if st.session_state.app_selected_page not in menu_pages:
-        st.session_state.app_selected_page = menu_pages[0]
-    
-    selected_page = option_menu(
-        menu_title=None,
-        options=menu_pages,
-        icons=menu_icons,
-        default_index=menu_pages.index(st.session_state.app_selected_page),
-        styles={
-            "container": {"padding": "0!important", "background-color": "transparent"},
-            "icon": {"color": "#0088CC", "font-size": "18px"}, 
-            "nav-link": {
-                "font-size": "15px", 
-                "font-weight": "700", 
-                "text-align": "left", 
-                "margin": "6px 0px", 
-                "color": "#94A3B8",
-                "padding": "12px 15px",
-                "border-radius": "8px"
-            },
-            "nav-link-selected": {
-                "background-color": "#1E3B8A", 
-                "color": "#FFFFFF", 
-                "font-weight": "800",
-                "box-shadow": "0px 4px 10px rgba(30, 59, 138, 0.4)"
-            },
+        menu_pages = ADMIN_PAGES if is_admin else STORE_STAFF_PAGES
+        icon_map = {
+            "Dashboard": "speedometer2",
+            "Factory Store Slip": "upc-scan",
+            "Payments & Voucher": "receipt",
+            "Vendor Bills": "journal-check",
+            "Vendor Ledger": "journal-text",
+            "Vendor Directory": "people-fill",
+            "Items Catalog": "tags-fill",
+            "Reports": "bar-chart-line",
         }
-    )
-    st.session_state.app_selected_page = selected_page
+        menu_icons = [icon_map.get(page, "circle") for page in menu_pages]
 
-    if selected_page not in menu_pages:
-        selected_page = menu_pages[0]
+        if st.session_state.app_selected_page not in menu_pages:
+            st.session_state.app_selected_page = menu_pages[0]
+
+        selected_page = option_menu(
+            menu_title=None,
+            options=menu_pages,
+            icons=menu_icons,
+            default_index=menu_pages.index(st.session_state.app_selected_page),
+            styles={
+                "container": {"padding": "0!important", "background-color": "transparent"},
+                "icon": {"color": "#0088CC", "font-size": "18px"},
+                "nav-link": {
+                    "font-size": "15px",
+                    "font-weight": "700",
+                    "text-align": "left",
+                    "margin": "6px 0px",
+                    "color": "#94A3B8",
+                    "padding": "12px 15px",
+                    "border-radius": "8px"
+                },
+                "nav-link-selected": {
+                    "background-color": "#1E3B8A",
+                    "color": "#FFFFFF",
+                    "font-weight": "800",
+                    "box-shadow": "0px 4px 10px rgba(30, 59, 138, 0.4)"
+                },
+            }
+        )
         st.session_state.app_selected_page = selected_page
 
-    st.markdown("---")
-    gs_connected, gs_status_text = google_sheets_status()
-    if st.button("Refresh Google Sheets connection", use_container_width=True):
-        _clear_optional_cache(_get_gspread_spreadsheet)
-        _clear_optional_cache(_public_sheet_ping)
-        _clear_optional_cache(_public_sheet_ping_by_name)
-        _clear_optional_cache(_read_public_sheet_csv)
-        _clear_optional_cache(_read_public_sheet_by_name)
-        st.rerun()
+        if selected_page not in menu_pages:
+            selected_page = menu_pages[0]
+            st.session_state.app_selected_page = selected_page
 
-    if gs_connected:
-        st.success("Google Sheets backup: Active")
-        st.caption(gs_status_text)
-    else:
-        st.info("Google Sheets backup: Local fallback mode")
-        st.caption(gs_status_text)
+        if st.button("Logout"):
+            _logout_current_user()
+            st.rerun()
 
-    if is_admin and st.button("📦 Export Local Backup", use_container_width=True):
-        backup_bytes, backup_name = build_backup_zip()
-        st.download_button(
-            label="Download ERP Backup",
-            data=backup_bytes,
-            file_name=backup_name,
-            mime="application/zip",
-            key="erp_backup_download"
-        )
-    st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
+        st.markdown("---")
+        gs_connected, gs_status_text = google_sheets_status()
+        if st.button("Refresh Google Sheets connection", use_container_width=True):
+            _get_gspread_spreadsheet.clear()
+            _public_sheet_ping.clear()
+            _public_sheet_ping_by_name.clear()
+            _read_public_sheet_csv.clear()
+            _read_public_sheet_by_name.clear()
+            st.rerun()
 
-# Always render vendor widgets from a fresh synchronized source.
-vendor_catalog = _fresh_vendor_catalog_for_ui()
+        if gs_connected:
+            st.success("Google Sheets backup: Active")
+            st.caption(gs_status_text)
+        else:
+            st.info("Google Sheets backup: Local fallback mode")
+            st.caption(gs_status_text)
+
+        if is_admin and st.button("📦 Export Local Backup", use_container_width=True):
+            backup_bytes, backup_name = build_backup_zip()
+            st.download_button(
+                label="Download ERP Backup",
+                data=backup_bytes,
+                file_name=backup_name,
+                mime="application/zip",
+                key="erp_backup_download"
+            )
+        st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
+
+authenticated_role = _current_authenticated_role()
+if not authenticated_role:
+    st.title("Prexa Industries")
+    st.info("Sign in from the sidebar to continue.")
+    st.stop()
+
+is_admin = authenticated_role == AUTH_ROLE_ADMIN
+vendor_catalog = load_vendor_catalog()
+
+if is_admin:
+    df_inward = load_inward_data()
+    df_payments = load_payments_data()
+else:
+    df_inward = pd.DataFrame(columns=INWARD_COLUMNS)
+    df_payments = pd.DataFrame(columns=PAYMENT_COLUMNS)
 
 # Load Datasets
-df_inward = load_inward_data()
-df_payments = load_payments_data()
-
 if not df_inward.empty:
     df_inward["Total Amount (PKR)"] = pd.to_numeric(df_inward["Total Amount (PKR)"], errors='coerce').fillna(0)
 if not df_payments.empty:
@@ -2305,187 +2520,190 @@ if selected_page == "Dashboard":
 
 # 2. FACTORY STORE SLIP
 elif selected_page == "Factory Store Slip":
-    st.markdown("<div class='store-slip-shell'>", unsafe_allow_html=True)
-    st.subheader("🏭 Factory Store Slip")
-    st.caption("Generate unpriced store slips. Rate and total amount are hidden in this interface by design.")
-
-    if not vendor_catalog:
-        st.warning("No vendors are available in the catalog. Add vendors in Vendor Directory first.")
+    if not is_admin:
+        render_store_manager_portal(vendor_catalog)
     else:
-        vendor_options = sorted(vendor_catalog.keys())
-        generate_slip = False
-        print_slip_now = False
-        with st.container(border=True):
-            st.markdown("### Create a store slip")
-            st.caption("Touch-friendly input layout for tablets and mobile screens.")
-            with st.form("factory_slip_form", clear_on_submit=True):
-                selected_slip_vendor = st.selectbox(
-                    "Vendor",
-                    options=vendor_options,
-                    key="factory_slip_vendor_select",
-                )
-                slip_item_name = st.text_input(
-                    "Item name",
-                    key="factory_slip_item_input",
-                    placeholder="Type item name",
-                )
-                slip_quantity = st.number_input(
-                    "Quantity",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key="factory_slip_quantity_input",
-                )
-                st.text_input(
-                    "Date and time",
-                    value=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    disabled=True,
-                )
-                action_col1, action_col2 = st.columns(2)
-                generate_slip = action_col1.form_submit_button("Generate and save slip")
-                print_slip_now = action_col2.form_submit_button("🖨️ Print Slip")
+        st.markdown("<div class='store-slip-shell'>", unsafe_allow_html=True)
+        st.subheader("🏭 Factory Store Slip")
+        st.caption("Generate unpriced store slips. Rate and total amount are hidden in this interface by design.")
 
-        if print_slip_now:
-            latest_print_html = st.session_state.get("factory_last_print_html", "")
-            if not latest_print_html:
-                st.warning("Generate at least one slip first, then tap Print Slip.")
-            else:
-                st.session_state.factory_last_print_view_uri = build_print_view_data_uri(latest_print_html)
-                st.info("Mobile popup blockers can stop automatic printing. Use the open-print-view button below.")
-
-        if generate_slip:
-            normalized_item = to_strict_title_case(slip_item_name)
-            if not normalized_item:
-                st.error("Item name is required.")
-            else:
-                slip_code = uuid.uuid4().hex[:12].upper()
-                created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-                slip_image = build_slip_image(
-                    selected_slip_vendor,
-                    normalized_item,
-                    int(slip_quantity),
-                    slip_code,
-                    created_at,
-                )
-
-                slip_filename = os.path.join("slips", f"slip_{slip_code}.png")
-                slip_image.save(slip_filename)
-                append_slip_record(selected_slip_vendor, normalized_item, int(slip_quantity), slip_code, slip_filename, created_at)
-
-                append_inward_record(
-                    datetime.now().strftime("%Y-%m-%d"),
-                    selected_slip_vendor,
-                    normalized_item,
-                    float(slip_quantity),
-                    0.0,
-                    "Pending Rate Review",
-                )
-
-                st.success("Slip generated and sent to Inward as an unpriced pending entry.")
-
-                with st.container(border=True):
-                    st.markdown("### Slip details")
-                    st.text_input("Slip code", value=slip_code, disabled=True, key=f"slip_code_{slip_code}")
-                    st.text_input("Date and time", value=created_at, disabled=True, key=f"slip_time_{slip_code}")
-                    st.image(slip_image, caption="Factory store slip preview")
-
-                    buffer = io.BytesIO()
-                    slip_image.save(buffer, format="PNG")
-                    buffer.seek(0)
-                    st.download_button(
-                        "Download slip PNG",
-                        data=buffer,
-                        file_name=f"slip_{slip_code}.png",
-                        mime="image/png",
-                        key=f"download_slip_{slip_code}",
+        if not vendor_catalog:
+            st.warning("No vendors are available in the catalog. Add vendors in Vendor Directory first.")
+        else:
+            vendor_options = sorted(vendor_catalog.keys())
+            generate_slip = False
+            print_slip_now = False
+            with st.container(border=True):
+                st.markdown("### Create a store slip")
+                st.caption("Touch-friendly input layout for tablets and mobile screens.")
+                with st.form("factory_slip_form", clear_on_submit=True):
+                    selected_slip_vendor = st.selectbox(
+                        "Vendor",
+                        options=vendor_options,
+                        key="factory_slip_vendor_select",
                     )
+                    slip_item_name = st.text_input(
+                        "Item name",
+                        key="factory_slip_item_input",
+                        placeholder="Type item name",
+                    )
+                    slip_quantity = st.number_input(
+                        "Quantity",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                        key="factory_slip_quantity_input",
+                    )
+                    st.text_input(
+                        "Date and time",
+                        value=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        disabled=True,
+                    )
+                    action_col1, action_col2 = st.columns(2)
+                    generate_slip = action_col1.form_submit_button("Generate and save slip")
+                    print_slip_now = action_col2.form_submit_button("🖨️ Print Slip")
 
-                    barcode_uri = to_data_uri(build_barcode_image(slip_code, width=620, height=100))
-                    print_layout_html = build_print_html(
+            if print_slip_now:
+                latest_print_html = st.session_state.get("factory_last_print_html", "")
+                if not latest_print_html:
+                    st.warning("Generate at least one slip first, then tap Print Slip.")
+                else:
+                    st.session_state.factory_last_print_view_uri = build_print_view_data_uri(latest_print_html)
+                    st.info("Mobile popup blockers can stop automatic printing. Use the open-print-view button below.")
+
+            if generate_slip:
+                normalized_item = to_strict_title_case(slip_item_name)
+                if not normalized_item:
+                    st.error("Item name is required.")
+                else:
+                    slip_code = uuid.uuid4().hex[:12].upper()
+                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+                    slip_image = build_slip_image(
                         selected_slip_vendor,
                         normalized_item,
                         int(slip_quantity),
                         slip_code,
                         created_at,
-                        barcode_uri,
                     )
-                    st.session_state.factory_last_print_html = print_layout_html
-                    st.session_state.factory_last_slip_code = slip_code
-                    st.session_state.factory_last_print_view_uri = build_print_view_data_uri(print_layout_html)
 
-                    with st.expander("Open print-ready layout", expanded=False):
-                        components.html(
-                            print_layout_html,
-                            height=620,
+                    slip_filename = os.path.join("slips", f"slip_{slip_code}.png")
+                    slip_image.save(slip_filename)
+                    append_slip_record(selected_slip_vendor, normalized_item, int(slip_quantity), slip_code, slip_filename, created_at)
+
+                    append_inward_record(
+                        datetime.now().strftime("%Y-%m-%d"),
+                        selected_slip_vendor,
+                        normalized_item,
+                        float(slip_quantity),
+                        0.0,
+                        "Pending Rate Review",
+                    )
+
+                    st.success("Slip generated and sent to Inward as an unpriced pending entry.")
+
+                    with st.container(border=True):
+                        st.markdown("### Slip details")
+                        st.text_input("Slip code", value=slip_code, disabled=True, key=f"slip_code_{slip_code}")
+                        st.text_input("Date and time", value=created_at, disabled=True, key=f"slip_time_{slip_code}")
+                        st.image(slip_image, caption="Factory store slip preview")
+
+                        buffer = io.BytesIO()
+                        slip_image.save(buffer, format="PNG")
+                        buffer.seek(0)
+                        st.download_button(
+                            "Download slip PNG",
+                            data=buffer,
+                            file_name=f"slip_{slip_code}.png",
+                            mime="image/png",
+                            key=f"download_slip_{slip_code}",
                         )
 
-        latest_print_view_uri = st.session_state.get("factory_last_print_view_uri", "")
-        latest_print_html = st.session_state.get("factory_last_print_html", "")
-        if latest_print_view_uri and latest_print_html:
-            st.markdown(
-                f"""
-                <a href="{latest_print_view_uri}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:block;width:100%;">
-                                    <button style="width:100%;min-height:52px;border-radius:14px;border:1px solid rgba(13,59,102,0.22);background:#ffffff;color:#000000;font-weight:700;font-size:15px;cursor:pointer;">
-                    🖨️ Open printable view in new tab
-                  </button>
-                </a>
-                """,
-                unsafe_allow_html=True,
+                        barcode_uri = to_data_uri(build_barcode_image(slip_code, width=620, height=100))
+                        print_layout_html = build_print_html(
+                            selected_slip_vendor,
+                            normalized_item,
+                            int(slip_quantity),
+                            slip_code,
+                            created_at,
+                            barcode_uri,
+                        )
+                        st.session_state.factory_last_print_html = print_layout_html
+                        st.session_state.factory_last_slip_code = slip_code
+                        st.session_state.factory_last_print_view_uri = build_print_view_data_uri(print_layout_html)
+
+                        with st.expander("Open print-ready layout", expanded=False):
+                            components.html(
+                                print_layout_html,
+                                height=620,
+                            )
+
+            latest_print_view_uri = st.session_state.get("factory_last_print_view_uri", "")
+            latest_print_html = st.session_state.get("factory_last_print_html", "")
+            if latest_print_view_uri and latest_print_html:
+                st.markdown(
+                    f"""
+                    <a href="{latest_print_view_uri}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:block;width:100%;">
+                                        <button style="width:100%;min-height:52px;border-radius:14px;border:1px solid rgba(13,59,102,0.22);background:#ffffff;color:#000000;font-weight:700;font-size:15px;cursor:pointer;">
+                        🖨️ Open printable view in new tab
+                      </button>
+                    </a>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.download_button(
+                    "Download printable HTML",
+                    data=latest_print_html,
+                    file_name="factory_slip_print.html",
+                    mime="text/html",
+                    key="download_printable_slip_html",
+                )
+
+        recent_slips = get_recent_slips_store(8)
+        with st.container(border=True):
+            st.subheader("Recent slips")
+            if recent_slips:
+                render_controlled_table(
+                    pd.DataFrame([
+                        {
+                            "Slip Code": row[0],
+                            "Vendor": row[1],
+                            "Item": row[2],
+                            "Qty": row[3],
+                            "Created": row[4],
+                        }
+                        for row in recent_slips
+                    ]),
+                    show_index=False,
+                )
+            else:
+                st.info("No slips generated yet.")
+
+        with st.container(border=True):
+            st.subheader("📥 Inward records and rate assignment")
+            st.caption("Handle barcode inward capture, manual inward entry, and final rate assignment here.")
+
+        st.markdown("### 📷 Barcode scan / inward entry")
+        with st.form("barcode_form", clear_on_submit=True):
+            barcode_code = st.text_input(
+                "Scan or enter slip barcode",
+                value="",
+                placeholder="Scan barcode here or type the slip code manually",
+                key="barcode_code_input"
             )
-            st.download_button(
-                "Download printable HTML",
-                data=latest_print_html,
-                file_name="factory_slip_print.html",
-                mime="text/html",
-                key="download_printable_slip_html",
-            )
+            scan_btn = st.form_submit_button("Lookup & Record Slip")
 
-    recent_slips = get_recent_slips_store(8)
-    with st.container(border=True):
-        st.subheader("Recent slips")
-        if recent_slips:
-            render_controlled_table(
-                pd.DataFrame([
-                    {
-                        "Slip Code": row[0],
-                        "Vendor": row[1],
-                        "Item": row[2],
-                        "Qty": row[3],
-                        "Created": row[4],
-                    }
-                    for row in recent_slips
-                ]),
-                show_index=False,
-            )
-        else:
-            st.info("No slips generated yet.")
-
-    with st.container(border=True):
-        st.subheader("📥 Inward records and rate assignment")
-        st.caption("Handle barcode inward capture, manual inward entry, and final rate assignment here.")
-
-    st.markdown("### 📷 Barcode scan / inward entry")
-    with st.form("barcode_form", clear_on_submit=True):
-        barcode_code = st.text_input(
-            "Scan or enter slip barcode",
-            value="",
-            placeholder="Scan barcode here or type the slip code manually",
-            key="barcode_code_input"
-        )
-        scan_btn = st.form_submit_button("Lookup & Record Slip")
-
-    if scan_btn:
-        slip = lookup_slip_by_barcode(barcode_code)
-        if slip is None:
-            st.error("Barcode not found or slip database unavailable.")
-        else:
-            st.session_state.pending_inward_barcode = {
-                "slip_code": str(barcode_code).strip(),
-                "vendor": slip["Vendor"],
-                "item": slip["Item"],
-                "quantity": int(slip["Quantity"]),
-            }
-            st.success(f"Barcode {st.session_state.pending_inward_barcode['slip_code']} loaded. Edit the rate or other fields below.")
+        if scan_btn:
+            slip = lookup_slip_by_barcode(barcode_code)
+            if slip is None:
+                st.error("Barcode not found or slip database unavailable.")
+            else:
+                st.session_state.pending_inward_barcode = {
+                    "slip_code": str(barcode_code).strip(),
+                    "vendor": slip["Vendor"],
+                    "item": slip["Item"],
+                    "quantity": int(slip["Quantity"]),
+                }
+                st.success(f"Barcode {st.session_state.pending_inward_barcode['slip_code']} loaded. Edit the rate or other fields below.")
 
     pending_slip = st.session_state.get("pending_inward_barcode")
     if pending_slip:
@@ -2623,7 +2841,7 @@ elif selected_page == "Factory Store Slip":
                 st.success("Inward record deleted successfully.")
                 st.experimental_rerun()
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # 3. PAYMENTS & VOUCHER
 elif selected_page == "Payments & Voucher":
