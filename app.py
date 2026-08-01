@@ -646,6 +646,7 @@ WS_INWARD = "InwardRecords"
 WS_PAYMENTS = "Payments"
 WS_SLIPS = "StoreSlips"
 DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/11l7bawuKdDKhZLGwzN-hxrOer5CNI2oSkJQTPIDlQLc/edit?gid=0#gid=0"
+DEFAULT_PROJECT_GSHEET_NAME = "Factory Store Slip"
 VENDOR_MASTER_COLUMNS = ["Vendor", "Contact", "Address"]
 LOCAL_GSHEETS_CREDENTIALS = Path(__file__).resolve().with_name("credentials.json")
 LAST_GSHEETS_ERROR = ""
@@ -694,6 +695,11 @@ def _secrets_section(name: str) -> dict:
 def _gsheet_target() -> str:
     gs = _secrets_section("gsheets")
     return str(gs.get("spreadsheet") or gs.get("url") or gs.get("id") or DEFAULT_GSHEET_URL).strip()
+
+
+def _gsheet_name() -> str:
+    gs = _secrets_section("gsheets")
+    return str(gs.get("name") or gs.get("spreadsheet_name") or gs.get("title") or DEFAULT_PROJECT_GSHEET_NAME).strip()
 
 
 def is_google_sheets_configured() -> bool:
@@ -851,6 +857,7 @@ def _get_gspread_spreadsheet():
         return None
 
     target = _gsheet_target()
+    sheet_name = _gsheet_name()
     if not target:
         return None
 
@@ -859,21 +866,42 @@ def _get_gspread_spreadsheet():
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
+        service_account_info: dict = {}
         credentials_path = _google_credentials_path()
         if credentials_path is not None:
-            creds = Credentials.from_service_account_file(str(credentials_path), scopes=scopes)
+            with open(credentials_path, "r", encoding="utf-8") as credentials_file:
+                service_account_info = json.load(credentials_file)
+            creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
         else:
             service_account_info = _secrets_section("gcp_service_account")
             if not service_account_info:
                 return None
             creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+
         client = gspread.authorize(creds)
-        if target.startswith("http"):
-            return client.open_by_url(target)
-        if "/" not in target and len(target) >= 30:
-            return client.open_by_key(target)
-        return client.open(target)
-    except Exception:
+
+        spreadsheet = None
+        if sheet_name:
+            spreadsheet = client.open(sheet_name)
+        elif target.startswith("http"):
+            spreadsheet = client.open_by_url(target)
+        elif "/" not in target and len(target) >= 30:
+            spreadsheet = client.open_by_key(target)
+        else:
+            spreadsheet = client.open(target)
+
+        # No-op write probe to ensure service-account write access exists.
+        spreadsheet.batch_update({"requests": []})
+        return spreadsheet
+
+    except Exception as exc:
+        account_email = _service_account_email_from_info(service_account_info)
+        share_hint = ""
+        if account_email:
+            share_hint = f" Share this Google Sheet with Editor access to: {account_email}"
+        details = _record_gsheets_exception("google sheets connect", RuntimeError(f"{exc}.{share_hint}"))
+        if os.environ.get("GSHEETS_RAISE_ON_CONNECT_ERROR", "").strip().lower() in {"1", "true", "yes"}:
+            raise RuntimeError(details) from exc
         return None
 
 
@@ -923,6 +951,13 @@ def _record_gsheets_exception(context: str, exc: Exception) -> str:
 
 def _last_gsheets_error() -> str:
     return LAST_GSHEETS_ERROR
+
+
+def _service_account_email_from_info(info: dict) -> str:
+    try:
+        return str(info.get("client_email", "")).strip()
+    except Exception:
+        return ""
 
 
 def _get_or_create_worksheet(name: str, headers: list[str]):
@@ -1056,6 +1091,153 @@ def append_vendor_master_record(vendor: str, contact: str = "", address: str = "
     )
 
 
+def _normalize_vendor_catalog_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=VENDOR_COLUMNS)
+
+    normalized = df.copy()
+    rename_map: dict[str, str] = {}
+    for column in normalized.columns:
+        key = str(column).strip().lower()
+        if key == "vendor":
+            rename_map[column] = "Vendor"
+        elif key == "item":
+            rename_map[column] = "Item"
+        elif key == "rate":
+            rename_map[column] = "Rate"
+
+    if rename_map:
+        normalized = normalized.rename(columns=rename_map)
+
+    for required in VENDOR_COLUMNS:
+        if required not in normalized.columns:
+            normalized[required] = ""
+
+    return normalized[VENDOR_COLUMNS]
+
+
+def _vendor_catalog_rows(vendor_catalog_data: dict) -> list[list[object]]:
+    rows: list[list[object]] = []
+    for vendor_name, items in vendor_catalog_data.items():
+        vendor = str(vendor_name).strip()
+        if not vendor:
+            continue
+        if not items:
+            rows.append([vendor, "", ""])
+            continue
+        for item_name, item_rate in items.items():
+            item = str(item_name).strip()
+            if not item:
+                continue
+            rows.append([vendor, item, item_rate])
+    return rows
+
+
+def _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data: dict) -> None:
+    existing_values = worksheet.get_all_values()
+    if not existing_values:
+        worksheet.update("A1", [VENDOR_COLUMNS])
+        existing_values = [VENDOR_COLUMNS]
+
+    raw_header = [str(col).strip() for col in existing_values[0]]
+    header_lower = [col.lower() for col in raw_header]
+    if not {"vendor", "item", "rate"}.issubset(set(header_lower)):
+        worksheet.update("A1:C1", [VENDOR_COLUMNS])
+        raw_header = VENDOR_COLUMNS
+        header_lower = ["vendor", "item", "rate"]
+
+    vendor_idx = header_lower.index("vendor")
+    item_idx = header_lower.index("item")
+    rate_idx = header_lower.index("rate")
+
+    existing_row_by_key: dict[tuple[str, str], int] = {}
+    for row_number, row in enumerate(existing_values[1:], start=2):
+        vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
+        item = str(row[item_idx]).strip() if item_idx < len(row) else ""
+        if not vendor:
+            continue
+        existing_row_by_key[(vendor.casefold(), item.casefold())] = row_number
+
+    for vendor, item, rate in _vendor_catalog_rows(vendor_catalog_data):
+        key = (vendor.casefold(), item.casefold())
+        payload = [vendor, item, rate]
+        if key in existing_row_by_key:
+            row_number = existing_row_by_key[key]
+            worksheet.update(
+                f"A{row_number}:C{row_number}",
+                [payload],
+                value_input_option="USER_ENTERED",
+            )
+        else:
+            worksheet.append_row(payload, value_input_option="USER_ENTERED")
+
+
+def _get_gspread_spreadsheet_strict():
+    if gspread is None or Credentials is None:
+        raise RuntimeError("gspread/google-auth libraries are not available.")
+
+    target = _gsheet_target()
+    sheet_name = _gsheet_name()
+    if not target:
+        raise RuntimeError("Google Sheet target is not configured.")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials_path = _google_credentials_path()
+    if credentials_path is not None:
+        with open(credentials_path, "r", encoding="utf-8") as credentials_file:
+            service_account_info = json.load(credentials_file)
+        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    else:
+        service_account_info = _secrets_section("gcp_service_account")
+        if not service_account_info:
+            raise RuntimeError("Service account credentials are not configured.")
+        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+
+    client = gspread.authorize(creds)
+    if sheet_name:
+        spreadsheet = client.open(sheet_name)
+    elif target.startswith("http"):
+        spreadsheet = client.open_by_url(target)
+    elif "/" not in target and len(target) >= 30:
+        spreadsheet = client.open_by_key(target)
+    else:
+        spreadsheet = client.open(target)
+
+    # No-op write probe confirms write permission without changing data.
+    
+    return spreadsheet
+
+
+def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, contact: str = "", address: str = "") -> None:
+    """Save vendor catalog and vendor master row to Google Sheets without local fallback.
+
+    Any auth/permission/network error is intentionally raised so Streamlit shows the full traceback.
+    """
+    spreadsheet = _get_gspread_spreadsheet_strict()
+
+    try:
+        catalog_ws = spreadsheet.worksheet(WS_VENDOR)
+    except Exception:
+        catalog_ws = spreadsheet.add_worksheet(title=WS_VENDOR, rows="2000", cols=str(max(20, len(VENDOR_COLUMNS) + 4)))
+
+    _upsert_vendor_catalog_sheet(catalog_ws, vendor_catalog_data)
+
+    try:
+        master_ws = spreadsheet.worksheet(WS_VENDOR_MASTER)
+    except Exception:
+        master_ws = spreadsheet.add_worksheet(title=WS_VENDOR_MASTER, rows="2000", cols=str(max(20, len(VENDOR_MASTER_COLUMNS) + 4)))
+        master_ws.update("A1", [VENDOR_MASTER_COLUMNS])
+
+    existing_headers = [str(col).strip() for col in master_ws.row_values(1)]
+    if existing_headers != VENDOR_MASTER_COLUMNS:
+        master_ws.update("A1", [VENDOR_MASTER_COLUMNS])
+
+    master_ws.append_row([vendor.strip(), contact.strip(), address.strip()], value_input_option="USER_ENTERED")
+
+
 def ensure_local_data_files() -> None:
     if not os.path.exists(VENDOR_FILE):
         with open(VENDOR_FILE, "w") as file_handle:
@@ -1087,40 +1269,38 @@ def safe_read_csv(file_path: str, expected_columns: list[str]) -> pd.DataFrame:
 
 
 def load_vendor_catalog() -> dict:
-    if using_google_sheets():
-        df = _sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
-        catalog: dict[str, dict] = {}
-        if df.empty:
-            return catalog
+    def _catalog_from_df(df: Optional[pd.DataFrame]) -> dict:
+        normalized_df = _normalize_vendor_catalog_df(df)
+        if normalized_df.empty:
+            return {}
 
-        for _, row in df.iterrows():
+        catalog: dict[str, dict] = {}
+        for _, row in normalized_df.iterrows():
             vendor = str(row.get("Vendor", "")).strip()
             item = str(row.get("Item", "")).strip()
-            if not vendor:
-                continue
-            if vendor not in catalog:
-                catalog[vendor] = {}
-            if item:
-                catalog[vendor][item] = _safe_float(row.get("Rate", 0.0), 0.0)
-        return catalog
+            rate = _safe_float(row.get("Rate", 0.0), 0.0)
 
-    public_df = _public_sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
-    if public_df is not None:
-        catalog: dict[str, dict] = {}
-        if public_df.empty:
-            return catalog
-        for _, row in public_df.iterrows():
-            vendor = str(row.get("Vendor", "")).strip()
-            item = str(row.get("Item", "")).strip()
             if not vendor:
                 continue
+
             catalog.setdefault(vendor, {})
             if item:
-                catalog[vendor][item] = _safe_float(row.get("Rate", 0.0), 0.0)
+                catalog[vendor][item] = rate
+
         return catalog
+
+    if using_google_sheets():
+        sheet_df = _sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
+        return _catalog_from_df(sheet_df)
+
+    public_df = _public_sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
+    public_catalog = _catalog_from_df(public_df)
+    if public_catalog:
+        return public_catalog
 
     if not os.path.exists(VENDOR_FILE):
         return {}
+
     try:
         with open(VENDOR_FILE, "r") as file_handle:
             data = json.load(file_handle)
@@ -1131,16 +1311,14 @@ def load_vendor_catalog() -> dict:
 
 def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
     if google_sheets_write_enabled():
-        rows = []
-        for vendor, items in vendor_catalog_data.items():
-            if not items:
-                rows.append({"Vendor": vendor, "Item": "", "Rate": ""})
-                continue
-            for item_name, item_rate in items.items():
-                rows.append({"Vendor": vendor, "Item": item_name, "Rate": item_rate})
-        out_df = pd.DataFrame(rows, columns=VENDOR_COLUMNS)
-        if _write_sheet_with_retry(WS_VENDOR, out_df, VENDOR_COLUMNS, retries=1):
-            return True, f"Vendor catalog saved to Google Sheets tab '{WS_VENDOR}'."
+        try:
+            worksheet = _get_or_create_worksheet(WS_VENDOR, VENDOR_COLUMNS)
+            if worksheet is not None:
+                _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data)
+                return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
+        except Exception as exc:
+            _record_gsheets_exception(f"vendor catalog upsert: {WS_VENDOR}", exc)
+
         if has_google_service_account():
             st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
 
@@ -2750,28 +2928,12 @@ elif selected_page == "Vendor Directory":
                     st.warning(f"Vendor '{vendor_name}' already exists.")
                 else:
                     vendor_catalog[vendor_name] = {}
-                    saved_catalog_to_sheet, catalog_message = save_vendor_catalog(vendor_catalog)
-                    saved_master_row, master_message = append_vendor_master_record(vendor_name, new_contact, new_address)
-
-                    if saved_catalog_to_sheet and saved_master_row:
-                        st.session_state["vendor_submit_status"] = {
-                            "kind": "success",
-                            "message": f"Vendor '{vendor_name}' added successfully. {master_message}",
-                        }
-                        st.rerun()
-                    elif saved_catalog_to_sheet:
-                        st.session_state["vendor_submit_status"] = {
-                            "kind": "warning",
-                            "message": f"Vendor '{vendor_name}' was added to the main catalog, but master row sync failed. {master_message}",
-                        }
-                        st.rerun()
-                    else:
-                        st.error(
-                            f"Vendor submit failed for Google Sheets. {catalog_message}"
-                        )
-                        trace_details = _last_gsheets_error().strip()
-                        if trace_details:
-                            st.code(trace_details, language="text")
+                    save_vendor_to_google_sheets_strict(vendor_catalog, vendor_name, new_contact, new_address)
+                    st.session_state["vendor_submit_status"] = {
+                        "kind": "success",
+                        "message": f"Vendor '{vendor_name}' added successfully and synced to Google Sheets.",
+                    }
+                    st.rerun()
 
 # 5. ITEMS CATALOG
 elif selected_page == "Items Catalog":
