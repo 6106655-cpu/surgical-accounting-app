@@ -874,6 +874,15 @@ def google_sheets_write_enabled() -> bool:
     return _get_gspread_spreadsheet() is not None
 
 
+def _refresh_app_data_after_submit() -> None:
+    _get_gspread_spreadsheet.clear()
+    _public_sheet_ping.clear()
+    _public_sheet_ping_by_name.clear()
+    _read_public_sheet_csv.clear()
+    _read_public_sheet_by_name.clear()
+    st.rerun()
+
+
 def _open_spreadsheet_with_fallback(client, target: str, sheet_name: str):
     target_value = str(target or "").strip()
     name_value = str(sheet_name or "").strip()
@@ -2740,7 +2749,7 @@ elif selected_page == "Factory Store Slip":
                 else:
                     st.success(f"Inward entry recorded for {slip_vendor} / {slip_item} ({int(slip_quantity)} pcs) with PKR {total_amount:,.2f}.")
                 st.session_state.pop("pending_inward_barcode", None)
-                st.experimental_rerun()
+                _refresh_app_data_after_submit()
 
             if st.button("Clear loaded entry", key="clear_pending_inward_barcode"):
                 st.session_state.pop("pending_inward_barcode", None)
@@ -2785,7 +2794,7 @@ elif selected_page == "Factory Store Slip":
                         payment_terms,
                     )
                     st.success("Inward entry saved successfully!")
-                    st.rerun()
+                    _refresh_app_data_after_submit()
 
     st.markdown("---")
     st.subheader("📊 Recent Inward Records")
@@ -2831,7 +2840,7 @@ elif selected_page == "Factory Store Slip":
                     edit_payment_terms,
                 )
                 st.success("Inward record updated successfully.")
-                st.experimental_rerun()
+                _refresh_app_data_after_submit()
 
         with st.expander("Delete selected inward record"):
             st.warning("This will permanently remove the selected inward record.")
@@ -2839,7 +2848,7 @@ elif selected_page == "Factory Store Slip":
             if confirm_inward_delete and st.button("Delete Inward Record", key="delete_inward_record"):
                 delete_inward_record(int(selected_inward))
                 st.success("Inward record deleted successfully.")
-                st.experimental_rerun()
+                _refresh_app_data_after_submit()
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2878,7 +2887,7 @@ elif selected_page == "Payments & Voucher":
                 save_payment_data(pd.concat([existing_payments, new_pay], ignore_index=True))
                 st.session_state['selected_voucher'] = next_v_num
                 st.success(f"✅ Payment Saved! Voucher {next_v_num} created successfully.")
-                st.rerun()
+                _refresh_app_data_after_submit()
 
     with col_pay2:
         st.markdown("### 🔍 Select Vendor Ledger View")
@@ -3045,7 +3054,7 @@ elif selected_page == "Payments & Voucher":
                     edit_notes,
                 )
                 st.success("Payment record updated successfully.")
-                st.experimental_rerun()
+                _refresh_app_data_after_submit()
 
         with st.expander("Delete selected payment"):
             st.warning("This will permanently remove the selected payment record.")
@@ -3053,7 +3062,7 @@ elif selected_page == "Payments & Voucher":
             if confirm_payment_delete and st.button("Delete Payment Record", key="delete_payment_record"):
                 delete_payment_record(int(selected_payment))
                 st.success("Payment record deleted successfully.")
-                st.experimental_rerun()
+                _refresh_app_data_after_submit()
 
 # 5. VENDOR BILLS
 elif selected_page == "Vendor Bills":
@@ -3128,7 +3137,7 @@ elif selected_page == "Vendor Bills":
                         ]
                         save_inward_data(df_inward)
                         st.success("Bill updated successfully.")
-                        st.rerun()
+                        _refresh_app_data_after_submit()
 
                 with st.expander("Delete selected bill"):
                     st.warning("This will permanently delete the selected bill.")
@@ -3137,7 +3146,7 @@ elif selected_page == "Vendor Bills":
                         df_inward.drop(index=selected_bill_id, inplace=True)
                         save_inward_data(df_inward)
                         st.success("Bill deleted successfully.")
-                        st.rerun()
+                        _refresh_app_data_after_submit()
 
         with payments_tab:
             if v_payments.empty:
@@ -3178,7 +3187,7 @@ elif selected_page == "Vendor Bills":
                         ]
                         save_payment_data(df_payments)
                         st.success("Payment updated successfully.")
-                        st.rerun()
+                        _refresh_app_data_after_submit()
 
                 with st.expander("Delete selected payment"):
                     st.warning("This will permanently delete the selected payment.")
@@ -3187,7 +3196,7 @@ elif selected_page == "Vendor Bills":
                         df_payments.drop(index=selected_payment_id, inplace=True)
                         save_payment_data(df_payments)
                         st.success("Payment deleted successfully.")
-                        st.rerun()
+                        _refresh_app_data_after_submit()
 
 # 5. VENDOR LEDGER
 elif selected_page == "Vendor Ledger":
@@ -3387,7 +3396,7 @@ elif selected_page == "Vendor Directory":
                         "kind": "success",
                         "message": f"Vendor '{vendor_name}' added successfully and synced to Google Sheets.",
                     }
-                    st.rerun()
+                    _refresh_app_data_after_submit()
 
 # 5. ITEMS CATALOG
 elif selected_page == "Items Catalog":
@@ -3413,5 +3422,8 @@ elif selected_page == "Items Catalog":
             if add_i_btn and item_n:
                 vendor_catalog[target_v][item_n] = item_r
                 save_vendor_catalog(vendor_catalog)
-                st.success(f"Item '{item_n}' added successfully!")
-                st.rerun()
+                st.session_state["vendor_submit_status"] = {
+                    "kind": "success",
+                    "message": f"Item '{item_n}' added successfully for vendor '{target_v}'.",
+                }
+                _refresh_app_data_after_submit()
