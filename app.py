@@ -680,18 +680,31 @@ def _public_sheet_gid(sheet_name: str) -> Optional[str]:
         except Exception:
             pass
 
-    return None
+    # Most Google Sheet links open first tab by default.
+    return "0"
 
 
 @st.cache_data(show_spinner=False, ttl=120)
 def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
     if not sheet_key or gid is None:
         return None
-    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&gid={gid}"
-    try:
-        return pd.read_csv(csv_url)
-    except Exception:
-        return None
+
+    csv_urls = [
+        f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&gid={gid}",
+        f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&single=true&gid={gid}",
+        f"https://docs.google.com/spreadsheets/d/{sheet_key}/gviz/tq?tqx=out:csv&gid={gid}",
+    ]
+
+    for csv_url in csv_urls:
+        try:
+            return pd.read_csv(csv_url)
+        except pd.errors.EmptyDataError:
+            # Empty public sheet/tab is still a valid reachable sheet.
+            return pd.DataFrame()
+        except Exception:
+            continue
+
+    return None
 
 
 @st.cache_data(show_spinner=False, ttl=120)
@@ -704,6 +717,8 @@ def _read_public_sheet_by_name(sheet_key: str, sheet_name: str) -> Optional[pd.D
     )
     try:
         return pd.read_csv(csv_url)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
     except Exception:
         return None
 
@@ -733,27 +748,14 @@ def _public_sheet_to_df(name: str, headers: list[str]) -> Optional[pd.DataFrame]
 def _public_sheet_ping(sheet_key: str, gid: str) -> bool:
     if not sheet_key or gid is None:
         return False
-    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&gid={gid}"
-    try:
-        pd.read_csv(csv_url, nrows=1)
-        return True
-    except Exception:
-        return False
+    return _read_public_sheet_csv(sheet_key, gid) is not None
 
 
 @st.cache_data(show_spinner=False, ttl=120)
 def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
     if not sheet_key or not sheet_name:
         return False
-    csv_url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_key}/gviz/tq"
-        f"?tqx=out:csv&sheet={quote(sheet_name)}"
-    )
-    try:
-        pd.read_csv(csv_url, nrows=1)
-        return True
-    except Exception:
-        return False
+    return _read_public_sheet_by_name(sheet_key, sheet_name) is not None
 
 
 def google_sheets_write_enabled() -> bool:
