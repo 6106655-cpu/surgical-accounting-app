@@ -1110,7 +1110,7 @@ def load_vendor_catalog() -> dict:
         return {}
 
 
-def save_vendor_catalog(vendor_catalog_data: dict) -> None:
+def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
     if google_sheets_write_enabled():
         rows = []
         for vendor, items in vendor_catalog_data.items():
@@ -1121,12 +1121,13 @@ def save_vendor_catalog(vendor_catalog_data: dict) -> None:
                 rows.append({"Vendor": vendor, "Item": item_name, "Rate": item_rate})
         out_df = pd.DataFrame(rows, columns=VENDOR_COLUMNS)
         if _write_sheet_with_retry(WS_VENDOR, out_df, VENDOR_COLUMNS, retries=1):
-            return
+            return True, f"Vendor catalog saved to Google Sheets tab '{WS_VENDOR}'."
         if has_google_service_account():
             st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
 
     with open(VENDOR_FILE, "w") as file_handle:
         json.dump(vendor_catalog_data, file_handle, indent=2)
+    return False, "Saved locally; Google Sheets sync was unavailable or failed."
 
 
 def save_payment_data(df: pd.DataFrame) -> None:
@@ -2694,6 +2695,18 @@ elif selected_page == "Reports":
 elif selected_page == "Vendor Directory":
     st.subheader("👥 Vendor Management")
     col_v1, col_v2 = st.columns([2, 1])
+
+    vendor_status = st.session_state.pop("vendor_submit_status", None)
+    if isinstance(vendor_status, dict):
+        status_kind = str(vendor_status.get("kind", "")).lower()
+        status_message = str(vendor_status.get("message", "")).strip()
+        if status_message:
+            if status_kind == "success":
+                st.success(status_message)
+            elif status_kind == "warning":
+                st.warning(status_message)
+            else:
+                st.error(status_message)
     
     with col_v1:
         st.markdown("### 📋 All Vendors List")
@@ -2715,14 +2728,25 @@ elif selected_page == "Vendor Directory":
                     st.warning(f"Vendor '{vendor_name}' already exists.")
                 else:
                     vendor_catalog[vendor_name] = {}
-                    save_vendor_catalog(vendor_catalog)
-                    saved_to_sheet, sheet_message = append_vendor_master_record(vendor_name, new_contact, new_address)
-                    if saved_to_sheet:
-                        st.success(sheet_message)
+                    saved_catalog_to_sheet, catalog_message = save_vendor_catalog(vendor_catalog)
+                    saved_master_row, master_message = append_vendor_master_record(vendor_name, new_contact, new_address)
+
+                    if saved_catalog_to_sheet and saved_master_row:
+                        st.session_state["vendor_submit_status"] = {
+                            "kind": "success",
+                            "message": f"Vendor '{vendor_name}' added successfully. {master_message}",
+                        }
+                        st.rerun()
+                    elif saved_catalog_to_sheet:
+                        st.session_state["vendor_submit_status"] = {
+                            "kind": "warning",
+                            "message": f"Vendor '{vendor_name}' was added to the main catalog, but master row sync failed. {master_message}",
+                        }
+                        st.rerun()
                     else:
-                        st.error(sheet_message)
-                    st.success(f"Vendor '{vendor_name}' added successfully!")
-                    st.rerun()
+                        st.error(
+                            f"Vendor submit failed for Google Sheets. {catalog_message}"
+                        )
 
 # 5. ITEMS CATALOG
 elif selected_page == "Items Catalog":
