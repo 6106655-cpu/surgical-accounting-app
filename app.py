@@ -640,10 +640,12 @@ PAYMENT_COLUMNS = [
 SLIP_COLUMNS = ["slip_code", "vendor", "item", "quantity", "created_at", "filename"]
 
 WS_VENDOR = "VendorCatalog"
+WS_VENDOR_MASTER = "Vendors"
 WS_INWARD = "InwardRecords"
 WS_PAYMENTS = "Payments"
 WS_SLIPS = "StoreSlips"
 DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/11l7bawuKdDKhZLGwzN-hxrOer5CNI2oSkJQTPIDlQLc/edit?gid=0#gid=0"
+VENDOR_MASTER_COLUMNS = ["Vendor", "Contact", "Address"]
 LOCAL_GSHEETS_CREDENTIALS = Path(__file__).resolve().with_name("credentials.json")
 
 INWARD_COLUMNS = [
@@ -999,6 +1001,40 @@ def _write_sheet_with_retry(name: str, df: pd.DataFrame, headers: list[str], ret
         if attempt < attempts - 1:
             _get_gspread_spreadsheet.clear()
     return False
+
+
+def _append_sheet_row(name: str, headers: list[str], row_values: list[object]) -> tuple[bool, str]:
+    worksheet = _get_or_create_worksheet(name, headers)
+    if worksheet is None:
+        return False, f"Worksheet '{name}' could not be opened or created."
+
+    try:
+        existing_headers = worksheet.row_values(1)
+    except Exception:
+        existing_headers = []
+
+    if [str(col).strip() for col in existing_headers] != headers:
+        try:
+            worksheet.update("A1", [headers])
+        except Exception:
+            return False, f"Worksheet '{name}' header update failed."
+
+    try:
+        worksheet.append_row(["" if value is None else value for value in row_values], value_input_option="USER_ENTERED")
+        return True, f"Vendor saved to Google Sheets tab '{name}'."
+    except Exception as exc:
+        return False, f"Google Sheets append failed: {exc}"
+
+
+def append_vendor_master_record(vendor: str, contact: str = "", address: str = "") -> tuple[bool, str]:
+    if not google_sheets_write_enabled():
+        return False, "Google Sheets write access is not available."
+
+    return _append_sheet_row(
+        WS_VENDOR_MASTER,
+        VENDOR_MASTER_COLUMNS,
+        [vendor.strip(), contact.strip(), address.strip()],
+    )
 
 
 def ensure_local_data_files() -> None:
@@ -2668,12 +2704,24 @@ elif selected_page == "Vendor Directory":
         st.markdown("### ➕ Add New Vendor")
         with st.form("add_vendor_form", clear_on_submit=True):
             new_v = st.text_input("Enter Vendor Name:")
+            new_contact = st.text_input("Contact")
+            new_address = st.text_area("Address", height=90)
             add_v_btn = st.form_submit_button("Add Vendor")
-            if add_v_btn and new_v:
-                if new_v not in vendor_catalog:
-                    vendor_catalog[new_v] = {}
+            if add_v_btn:
+                vendor_name = new_v.strip()
+                if not vendor_name:
+                    st.error("Vendor name is required.")
+                elif vendor_name in vendor_catalog:
+                    st.warning(f"Vendor '{vendor_name}' already exists.")
+                else:
+                    vendor_catalog[vendor_name] = {}
                     save_vendor_catalog(vendor_catalog)
-                    st.success(f"Vendor '{new_v}' added successfully!")
+                    saved_to_sheet, sheet_message = append_vendor_master_record(vendor_name, new_contact, new_address)
+                    if saved_to_sheet:
+                        st.success(sheet_message)
+                    else:
+                        st.error(sheet_message)
+                    st.success(f"Vendor '{vendor_name}' added successfully!")
                     st.rerun()
 
 # 5. ITEMS CATALOG
