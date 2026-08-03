@@ -573,6 +573,8 @@ def generate_vendor_statement_pdf(
     closing_balance: float,
 ) -> io.BytesIO:
     # Lazy import keeps the app running even when reportlab is not installed.
+    from xml.sax.saxutils import escape
+
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import letter
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -609,6 +611,14 @@ def generate_vendor_statement_pdf(
         leading=12,
         textColor=colors.HexColor("#1F2937"),
     )
+    row_wrap_style = ParagraphStyle(
+        "RowWrap",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.4,
+        leading=9.1,
+        textColor=colors.HexColor("#1F2937"),
+    )
 
     elements.append(Paragraph("PREXA INDUSTRIES", title_style))
     elements.append(Paragraph("Surgical Instruments Manufacturing & Export<br/><b>Vendor Statement of Account</b>", subtitle_style))
@@ -638,12 +648,14 @@ def generate_vendor_statement_pdf(
 
     table_data = [["Date", "Type", "Reference / Lot", "Description / Item", "Qty", "Amount (PKR)", "Balance (PKR)"]]
     for row in ledger_rows:
+        reference_text = escape(str(row.get("reference_number") or ""))
+        item_text = escape(str(row.get("item_name") or ""))
         table_data.append(
             [
                 str(row.get("date") or ""),
                 str(row.get("entry_type") or ""),
-                str(row.get("reference_number") or ""),
-                str(row.get("item_name") or ""),
+                Paragraph(reference_text, row_wrap_style),
+                Paragraph(item_text, row_wrap_style),
                 f"{float(row.get('quantity') or 0.0):,.2f}",
                 f"{float(row.get('amount') or 0.0):,.2f}",
                 f"{float(row.get('running_balance') or 0.0):,.2f}",
@@ -651,7 +663,7 @@ def generate_vendor_statement_pdf(
         )
 
     # Total width is tuned for letter page with left/right margins (about 552 pts).
-    col_widths = [55, 80, 95, 150, 32, 70, 70]
+    col_widths = [50, 58, 88, 184, 32, 70, 70]
     ledger_table = Table(table_data, colWidths=col_widths)
     ledger_table.setStyle(
         TableStyle(
