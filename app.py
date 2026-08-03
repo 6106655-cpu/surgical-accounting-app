@@ -1,3802 +1,2373 @@
+import hashlib
 import io
-import importlib
-import json
 import os
+import re
 import shutil
 import sqlite3
-import time
-import traceback
-import uuid
-import zipfile
-from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
-from urllib.parse import parse_qs, quote, urlparse
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
 import streamlit as st
-from streamlit_option_menu import option_menu
-from db.database import get_connection
-import streamlit.components.v1 as components
+
+if TYPE_CHECKING:
+    from supabase import Client as SupabaseClient
+else:
+    SupabaseClient = Any
+
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
+    from supabase import create_client
 except Exception:
-    gspread = None
-    Credentials = None
-from slip_app import (
-    build_barcode_image,
-    build_print_html,
-    build_slip_image,
-    get_recent_slips,
-    init_db as init_slip_db,
-    save_slip_record,
-    to_data_uri,
-)
+    create_client = None
 
-try:
-    from fpdf import FPDF
-    FPDF_AVAILABLE = True
-except ImportError:
-    FPDF_AVAILABLE = False
 
-try:
-    code128 = importlib.import_module("reportlab.graphics.barcode.code128")
-    colors = importlib.import_module("reportlab.lib.colors")
-    A5 = importlib.import_module("reportlab.lib.pagesizes").A5
-    reportlab_styles = importlib.import_module("reportlab.lib.styles")
-    ParagraphStyle = reportlab_styles.ParagraphStyle
-    getSampleStyleSheet = reportlab_styles.getSampleStyleSheet
-    inch = importlib.import_module("reportlab.lib.units").inch
-    reportlab_platypus = importlib.import_module("reportlab.platypus")
-    HRFlowable = reportlab_platypus.HRFlowable
-    Paragraph = reportlab_platypus.Paragraph
-    SimpleDocTemplate = reportlab_platypus.SimpleDocTemplate
-    Spacer = reportlab_platypus.Spacer
-    Table = reportlab_platypus.Table
-    TableStyle = reportlab_platypus.TableStyle
-    REPORTLAB_AVAILABLE = True
-except Exception:
-    REPORTLAB_AVAILABLE = False
+SECTION_CONFIG = {
+    "dashboard": {
+        "label": "Command Center",
+        "caption": "Live view of sourcing, stock, and export receiving activity.",
+        "group": "Operations",
+    },
+    "vendors": {
+        "label": "Vendor Master",
+        "caption": "Approved supply partners for surgical manufacturing inputs.",
+        "group": "Master Data",
+    },
+    "items": {
+        "label": "Item Register",
+        "caption": "Raw materials and finished SKUs used in production and export orders.",
+        "group": "Master Data",
+    },
+    "receipts": {
+        "label": "Simplified Inward",
+        "caption": "Select vendor, pick assigned item, and enter quantity. Total amount is auto-calculated in the background.",
+        "group": "Execution",
+    },
+    "inward_summary": {
+        "label": "Inward Summary",
+        "caption": "Management view of inward totals by vendor and item without invoice complexity.",
+        "group": "Operations",
+    },
+    "vendor_ledger": {
+        "label": "Vendor Ledger",
+        "caption": "Per-vendor inward lot ledger with quantities, calculated amounts, and running balance totals.",
+        "group": "Operations",
+    },
+    "payment_slips": {
+        "label": "Payment Slips",
+        "caption": "Record simple payment slips with payee name, cash amount, description, and signature confirmation.",
+        "group": "Finance",
+    },
+    "users": {
+        "label": "Access Control",
+        "caption": "Role-based users for procurement, warehouse, and admin teams.",
+        "group": "Administration",
+    },
+}
 
-# Page Configuration
-st.set_page_config(page_title="Prexa Industries - ERP", layout="wide", initial_sidebar_state="expanded")
+ROLE_PERMISSIONS = {
+    "admin": {
+        "dashboard",
+        "vendors",
+        "items",
+        "receipts",
+        "inward_summary",
+        "vendor_ledger",
+        "payment_slips",
+        "users",
+    },
+    "procurement": {
+        "dashboard",
+        "vendors",
+        "items",
+        "receipts",
+        "inward_summary",
+        "vendor_ledger",
+        "payment_slips",
+    },
+    "warehouse": {"dashboard", "items", "receipts", "inward_summary", "vendor_ledger"},
+    "viewer": {"dashboard", "inward_summary", "vendor_ledger", "payment_slips"},
+}
 
-# Custom Modern & Stylish CSS
-st.markdown("""
-    <style>
-    :root {
-        --prexa-bg: #FFFFFF;
-        --prexa-text: #000000;
-        --prexa-text-strong: #000000;
-        --prexa-text-muted: #000000;
-        --prexa-border: rgba(29, 53, 87, 0.22);
-        --prexa-body-size: 18px;
-        --prexa-caption-size: 15px;
-        --prexa-label-size: 16px;
-        --prexa-card-text-size: 17px;
-    }
-    html, body, .stApp {
-        background: var(--prexa-bg) !important;
-        color: var(--prexa-text);
-        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        color-scheme: light !important;
-    }
-    html, body {
-        margin: 0 !important;
-        padding: 0 !important;
-        min-height: 100%;
-        font-size: var(--prexa-body-size);
-        line-height: 1.55;
-    }
-    [data-testid="stAppViewContainer"],
-    [data-testid="stAppViewContainer"] .main,
-    [data-testid="stAppViewContainer"] .main > div,
-    [data-testid="stAppViewContainer"] .main .block-container,
-    [data-testid="stVerticalBlock"] {
-        background: var(--prexa-bg) !important;
-        color: var(--prexa-text) !important;
-    }
-    [data-testid="stAppViewContainer"] .main,
-    [data-testid="stAppViewContainer"] .main * {
-        color: var(--prexa-text) !important;
-        -webkit-text-fill-color: var(--prexa-text) !important;
-    }
-    .stApp,
-    .stApp *,
-    [data-testid="stSidebar"],
-    [data-testid="stSidebar"] *,
-    table,
-    thead,
-    tbody,
-    tr,
-    th,
-    td {
-        color: #000000 !important;
-        -webkit-text-fill-color: #000000 !important;
-    }
-    [data-testid="stAppViewContainer"] .main h1,
-    [data-testid="stAppViewContainer"] .main h2,
-    [data-testid="stAppViewContainer"] .main h3,
-    [data-testid="stAppViewContainer"] .main h4,
-    [data-testid="stAppViewContainer"] .main h5,
-    [data-testid="stAppViewContainer"] .main h6,
-    [data-testid="stAppViewContainer"] .main p,
-    [data-testid="stAppViewContainer"] .main span,
-    [data-testid="stAppViewContainer"] .main label,
-    [data-testid="stAppViewContainer"] .main li,
-    [data-testid="stAppViewContainer"] .main small,
-    [data-testid="stAppViewContainer"] .main strong,
-    [data-testid="stAppViewContainer"] .main td,
-    [data-testid="stAppViewContainer"] .main th,
-    [data-testid="stAppViewContainer"] .main [data-testid="stMarkdownContainer"],
-    [data-testid="stAppViewContainer"] .main [data-testid="stWidgetLabel"] {
-        color: var(--prexa-text-strong) !important;
-        -webkit-text-fill-color: var(--prexa-text-strong) !important;
-    }
-    [data-testid="stAppViewContainer"] .main p,
-    [data-testid="stAppViewContainer"] .main li,
-    [data-testid="stAppViewContainer"] .main td,
-    [data-testid="stAppViewContainer"] .main th,
-    [data-testid="stAppViewContainer"] .main span,
-    [data-testid="stAppViewContainer"] .main div,
-    [data-testid="stAppViewContainer"] .main small,
-    [data-testid="stAppViewContainer"] .main .stCaption,
-    [data-testid="stAppViewContainer"] .main [data-testid="stCaptionContainer"],
-    [data-testid="stAppViewContainer"] .main label,
-    [data-testid="stAppViewContainer"] .main [data-testid="stWidgetLabel"],
-    [data-testid="stAppViewContainer"] .main [data-baseweb="input"] input,
-    [data-testid="stAppViewContainer"] .main [data-baseweb="textarea"] textarea,
-    [data-testid="stAppViewContainer"] .main [role="combobox"],
-    [data-testid="stAppViewContainer"] .main [role="option"] {
-        font-size: var(--prexa-body-size) !important;
-        line-height: 1.55 !important;
-    }
-    [data-testid="stAppViewContainer"] .main .stCaption,
-    [data-testid="stAppViewContainer"] .main [data-testid="stCaptionContainer"],
-    [data-testid="stAppViewContainer"] .main small {
-        font-size: var(--prexa-caption-size) !important;
-        line-height: 1.45 !important;
-    }
-    [data-testid="stAppViewContainer"] .main label,
-    [data-testid="stAppViewContainer"] .main [data-testid="stWidgetLabel"],
-    [data-testid="stAppViewContainer"] .main [data-testid="stMarkdownContainer"] label {
-        font-size: var(--prexa-label-size) !important;
-        line-height: 1.35 !important;
-        font-weight: 600 !important;
-    }
-    [data-testid="stAppViewContainer"] .main input,
-    [data-testid="stAppViewContainer"] .main textarea,
-    [data-testid="stAppViewContainer"] .main [role="combobox"],
-    [data-testid="stAppViewContainer"] .main [role="listbox"],
-    [data-testid="stAppViewContainer"] .main [role="option"],
-    [data-testid="stAppViewContainer"] .main [role="columnheader"],
-    [data-testid="stAppViewContainer"] .main [role="gridcell"] {
-        color: var(--prexa-text) !important;
-        -webkit-text-fill-color: var(--prexa-text) !important;
-    }
-    .stApp {
-        padding-top: 0;
-        min-height: 100vh;
-    }
-
-    .header-container {
-        display: none;
-    }
-    .company-title {
-        color: var(--prexa-text-strong);
-        font-size: 34px;
-        font-weight: 900;
-        margin: 0 0 4px 0;
-        line-height: 1.05;
-        letter-spacing: 0.2px;
-    }
-    .company-address {
-        color: var(--prexa-text-muted);
-        font-size: 13px;
-        margin: 0 0 14px 0;
-        line-height: 1.4;
-    }
-
-    [data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #FFFFFF 0%, #F4F8FF 100%) !important;
-        border-right: 1px solid var(--prexa-border) !important;
-        box-shadow: 4px 0 30px rgba(29, 53, 87, 0.08);
-    }
-    [data-testid="stSidebar"] .sidebar-content {
-        padding-top: 14px;
-    }
-    .sidebar-brand {
-        color: var(--prexa-text-strong);
-        font-weight: 900;
-        font-size: 20px;
-        text-align: center;
-        margin-bottom: 6px;
-        letter-spacing: 0.08em;
-        line-height: 1.05;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    .sidebar-divider {
-        width: 100%;
-        height: 1px;
-        background: rgba(29, 53, 87, 0.16);
-        margin: 8px 0 12px 0;
-    }
-    .sidebar-header {
-        color: var(--prexa-text-strong);
-        font-weight: 800;
-        font-size: 16px;
-        text-align: center;
-        padding: 8px 0 10px 0;
-        border-bottom: 1px solid var(--prexa-border);
-        margin-bottom: 14px;
-    }
-    [data-testid="stSidebar"] button {
-        color: var(--prexa-text-strong) !important;
-        border-radius: 14px !important;
-        border: 1px solid var(--prexa-border) !important;
-        background: #FFFFFF !important;
-        box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-    }
-    [data-testid="stSidebar"] button:hover {
-        background: #EEF4FF !important;
-    }
-
-    .block-container {
-        background: #FFFFFF !important;
-        padding: 44px 18px 18px 18px !important;
-        max-width: 100% !important;
-    }
-    [data-testid="stAppViewContainer"] .main .block-container {
-        padding-top: 44px !important;
-    }
-    .css-1d391kg, .css-1d391kg .element-container, .css-18e3th9, .element-container {
-        border: none !important;
-        background: transparent !important;
-        box-shadow: none !important;
-    }
-
-    .panel-card, .kpi-group, .kpi-card, .ledger-card {
-        background: #FFFFFF;
-        border-radius: 20px;
-        border: 1px solid rgba(15, 23, 42, 0.08);
-        box-shadow: 0 18px 30px rgba(15, 23, 42, 0.05);
-        padding: 16px;
-        margin-bottom: 16px;
-    }
-    .panel-card *, .kpi-group *, .kpi-card *, .ledger-card * {
-        font-size: var(--prexa-card-text-size) !important;
-        line-height: 1.55 !important;
-    }
-    .panel-card {
-        padding: 16px;
-    }
-    .panel-title {
-        font-size: 20px;
-        font-weight: 800;
-        color: var(--prexa-text-strong);
-        margin-bottom: 8px;
-    }
-    .panel-title {
-        font-size: 20px;
-        font-weight: 800;
-        color: var(--prexa-text-strong);
-        margin-bottom: 16px;
-    }
-    .panel-subtitle {
-        color: var(--prexa-text-muted);
-        margin-bottom: 10px;
-    }
-    .panel-content {
-        margin-top: 6px;
-    }
-
-    .kpi-group {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 18px;
-        margin-bottom: 18px;
-    }
-    .kpi-card {
-        min-height: 110px;
-    }
-    .kpi-card h3 {
-        font-size: 14px;
-        margin-bottom: 12px;
-        color: var(--prexa-text-muted);
-        font-weight: 700;
-    }
-    .kpi-card .kpi-value {
-        font-size: 24px;
-        font-weight: 800;
-        color: var(--prexa-text-strong);
-        margin: 0;
-
-    @media (max-width: 768px) {
-        :root {
-            --prexa-body-size: 17px;
-            --prexa-caption-size: 14px;
-            --prexa-label-size: 15px;
-            --prexa-card-text-size: 16px;
-        }
-        .company-title {
-            font-size: 28px;
-        }
-        .sidebar-brand {
-            font-size: 18px;
-        }
-        .sidebar-header {
-            font-size: 15px;
-        }
-        .panel-title {
-            font-size: 18px;
-        }
-    }
-    }
-    .kpi-card.warning {
-        border-color: rgba(245, 158, 11, 0.22);
-    }
-    .kpi-card.warning .kpi-value {
-        color: var(--prexa-text-strong);
-    }
-
-    .metric-card {
-        background: #FFFFFF;
-        border-radius: 18px;
-        border: 1px solid rgba(148, 163, 184, 0.14);
-        box-shadow: 0 10px 18px rgba(15, 23, 42, 0.05);
-        padding: 10px 12px;
-        min-height: 95px;
-        height: 95px;
-        position: relative;
-        overflow: hidden;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        gap: 4px;
-        width: 100%;
-        box-sizing: border-box;
-    }
-    .metric-card::before {
-        content: "";
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 100%;
-        height: 4px;
-        border-top-left-radius: 18px;
-        border-top-right-radius: 18px;
-    }
-    .metric-card.accent-1::before { background: #2563EB; }
-    .metric-card.accent-2::before { background: #10B981; }
-    .metric-card.accent-3::before { background: #F59E0B; }
-    .metric-card.accent-4::before { background: #8B5CF6; }
-    .metric-card.accent-1 .metric-value { color: var(--prexa-text-strong); }
-    .metric-card.accent-2 .metric-value { color: var(--prexa-text-strong); }
-    .metric-card.accent-3 .metric-value { color: var(--prexa-text-strong); }
-    .metric-card.accent-4 .metric-value { color: var(--prexa-text-strong); }
-    .metric-card h3 {
-        margin-top: 0;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.08em;
-        margin-bottom: 4px;
-        color: var(--prexa-text-muted);
-        text-transform: uppercase;
-    }
-    .metric-card .metric-value {
-        font-size: 18px;
-        font-weight: 800;
-        color: var(--prexa-text-strong);
-        margin: 0;
-        line-height: 1.05;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    .metric-card .metric-helper {
-        color: var(--prexa-text-muted);
-        font-size: 12px;
-        margin-top: 4px;
-    }
-
-    .company-title {
-        color: var(--prexa-text-strong);
-        font-size: 34px;
-        font-weight: 900;
-        margin: 0 0 4px 0;
-        line-height: 1.05;
-        letter-spacing: 0.2px;
-    }
-    .company-address {
-        color: var(--prexa-text-muted);
-        font-size: 13px;
-        margin: 0 0 14px 0;
-        line-height: 1.4;
-    }
-
-    .prexa-table-wrap {
-        width: 100%;
-        overflow-x: auto;
-        background: #FFFFFF;
-        border: 1px solid rgba(15, 23, 42, 0.12);
-        border-radius: 12px;
-    }
-    .prexa-table {
-        width: 100%;
-        border-collapse: collapse;
-        background: #FFFFFF;
-    }
-    .prexa-table thead th {
-        background: #F8FAFC;
-        color: #000000 !important;
-        font-weight: 700;
-        text-align: left;
-        font-size: 13px;
-        border-bottom: 1px solid rgba(15, 23, 42, 0.14);
-    }
-    .prexa-table th,
-    .prexa-table td {
-        color: #000000 !important;
-        -webkit-text-fill-color: #000000 !important;
-        padding: 10px 12px;
-        font-size: 13px;
-        border-bottom: 1px solid rgba(15, 23, 42, 0.08);
-        vertical-align: top;
-    }
-    .prexa-table tbody tr:nth-child(even) {
-        background: #FCFDFF;
-    }
-    .prexa-table tbody tr:hover {
-        background: #F5F8FC;
-    }
-
-    .voucher-box {
-        border-radius: 22px;
-        background: #FFFFFF;
-        border: 1px solid rgba(15, 23, 42, 0.08);
-        box-shadow: 0 18px 38px rgba(15, 23, 42, 0.08);
-        padding: 26px;
-        margin-top: 16px;
-        margin-bottom: 16px;
-    }
-    .voucher-table th, .voucher-table td {
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        padding: 12px 14px;
-        font-size: 13px;
-        color: var(--prexa-text);
-    }
-    .voucher-table th {
-        background: #F8FAFC;
-    }
-    .sig-line {
-        border-top: 1px dashed rgba(15, 23, 42, 0.35);
-        width: 180px;
-        text-align: center;
-        padding-top: 8px;
-        font-size: 12px;
-        color: var(--prexa-text-muted);
-    }
-
-    button[kind="primary"] {
-        background: #E8F1FF !important;
-        color: var(--prexa-text-strong) !important;
-        border-radius: 14px !important;
-        border: 1px solid var(--prexa-border) !important;
-        box-shadow: 0 8px 14px rgba(29, 53, 87, 0.08) !important;
-    }
-    button[kind="secondary"] {
-        border-radius: 14px !important;
-    }
-
-    .store-slip-shell {
-        max-width: 920px;
-        margin: 0 auto;
-    }
-    .store-slip-shell .store-slip-section {
-        margin-bottom: 18px;
-    }
-    .store-slip-shell [data-testid="stForm"] {
-        border: 1px solid rgba(15, 23, 42, 0.08);
-        border-radius: 18px;
-        padding: 16px;
-        background: #FFFFFF;
-        box-shadow: 0 14px 28px rgba(15, 23, 42, 0.05);
-    }
-    .store-slip-shell .stButton > button,
-    .store-slip-shell .stDownloadButton > button,
-    .store-slip-shell div[data-testid="stFormSubmitButton"] button {
-        width: 100%;
-        min-height: 52px;
-        font-size: 15px;
-        font-weight: 700;
-    }
-    .store-slip-shell .stTextInput input,
-    .store-slip-shell .stNumberInput input,
-    .store-slip-shell div[data-baseweb="select"] > div,
-    .store-slip-shell textarea {
-        min-height: 50px;
-        font-size: 15px;
-        border-radius: 14px;
-    }
-    .store-slip-shell label,
-    .store-slip-shell [data-testid="stWidgetLabel"] {
-        font-size: 14px;
-        font-weight: 700;
-    }
-    .store-slip-shell iframe {
-        width: 100% !important;
-        max-width: 100%;
-    }
-
-    @media (max-width: 900px) {
-        html, body, .stApp {
-            color-scheme: light !important;
-        }
-        .block-container {
-            padding-left: 12px !important;
-            padding-right: 12px !important;
-        }
-        [data-testid="stAppViewContainer"] input,
-        [data-testid="stAppViewContainer"] textarea,
-        [data-testid="stAppViewContainer"] div[data-baseweb="select"] > div,
-        [data-testid="stAppViewContainer"] [role="combobox"],
-        [data-testid="stAppViewContainer"] [role="listbox"],
-        [data-testid="stAppViewContainer"] [role="option"] {
-            background: #FFFFFF !important;
-            color: var(--prexa-text) !important;
-            -webkit-text-fill-color: var(--prexa-text) !important;
-            border-color: rgba(15, 23, 42, 0.20) !important;
-        }
-        [data-testid="stAppViewContainer"] input::placeholder,
-        [data-testid="stAppViewContainer"] textarea::placeholder {
-            color: #000000 !important;
-            -webkit-text-fill-color: #000000 !important;
-        }
-        [data-testid="stAppViewContainer"] input:disabled,
-        [data-testid="stAppViewContainer"] textarea:disabled,
-        [data-testid="stAppViewContainer"] div[data-baseweb="select"] > div[aria-disabled="true"] {
-            background: #F8FAFC !important;
-            color: var(--prexa-text) !important;
-            opacity: 1 !important;
-        }
-        [data-testid="stAppViewContainer"] .stButton > button,
-        [data-testid="stAppViewContainer"] .stDownloadButton > button,
-        [data-testid="stAppViewContainer"] div[data-testid="stFormSubmitButton"] button,
-        [data-testid="stAppViewContainer"] button[kind="primary"],
-        [data-testid="stAppViewContainer"] button[kind="secondary"] {
-            background: #FFFFFF !important;
-            color: var(--prexa-text-strong) !important;
-            border: 1px solid rgba(15, 23, 42, 0.20) !important;
-            box-shadow: none !important;
-        }
-        .store-slip-shell {
-            max-width: 100%;
-        }
-        .store-slip-shell [data-testid="stForm"] {
-            padding: 14px;
-            border-radius: 16px;
-        }
-        .store-slip-shell .stTextInput input,
-        .store-slip-shell .stNumberInput input,
-        .store-slip-shell div[data-baseweb="select"] > div,
-        .store-slip-shell textarea {
-            min-height: 54px;
-            font-size: 16px;
-        }
-        .store-slip-shell .stButton > button,
-        .store-slip-shell .stDownloadButton > button,
-        .store-slip-shell div[data-testid="stFormSubmitButton"] button {
-            min-height: 56px;
-            font-size: 16px;
-            border-radius: 16px;
-        }
-        .store-slip-shell h3,
-        .store-slip-shell .stSubheader {
-            font-size: 1.1rem;
-        }
-    }
-
-    @media (max-width: 640px) {
-        .store-slip-shell .store-slip-section {
-            margin-bottom: 14px;
-        }
-        .store-slip-shell label,
-        .store-slip-shell [data-testid="stWidgetLabel"] {
-            font-size: 15px;
-        }
-        .store-slip-shell iframe {
-            min-height: 420px;
-        }
-    }
-
-    @media print {
-        @page {
-            size: A4 portrait;
-            margin: 10mm;
-        }
-        body {
-            background-color: #FFFFFF !important;
-            margin: 0 !important;
-            padding: 0 !important;
-        }
-        header, footer, nav, [data-testid="stSidebar"], .stApp > header, div[data-testid="stToolbar"], .element-container:not(:has(.voucher-box)) {
-            display: none !important;
-        }
-        body * {
-            visibility: hidden;
-        }
-        .voucher-box, .voucher-box * {
-            visibility: visible;
-        }
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# File Paths
-VENDOR_FILE = "vendor_catalog.json"
-INWARD_FILE = "inward_transactions.csv"
-PAYMENT_FILE = "vendor_payments.csv"
-LOCAL_BACKUP_ROOT = Path("data") / "local_backups"
-VENDOR_BACKUP_DIR = LOCAL_BACKUP_ROOT / "vendors"
-INWARD_BACKUP_DIR = LOCAL_BACKUP_ROOT / "inward_entries"
-PAYMENT_BACKUP_DIR = LOCAL_BACKUP_ROOT / "payments"
-DEFAULT_ADMIN_PIN = "1234"
-
-VENDOR_COLUMNS = ["Vendor", "Item", "Rate"]
-INWARD_COLUMNS = [
-    "Date",
-    "Vendor",
-    "Item",
-    "Quantity",
-    "Unit Rate (PKR)",
-    "Total Amount (PKR)",
-    "Payment Terms",
-]
-PAYMENT_COLUMNS = [
-    "Voucher No",
-    "Date",
-    "Vendor",
-    "Amount Paid (PKR)",
-    "Payment Mode",
-    "Payment Purpose / Description",
-    "Reference / Notes",
-]
-SLIP_COLUMNS = ["slip_code", "vendor", "item", "quantity", "created_at", "filename"]
-
-WS_VENDOR = "VendorCatalog"
-WS_VENDOR_MASTER = "Vendors"
-WS_INWARD = "InwardRecords"
-WS_PAYMENTS = "Payments"
-WS_SLIPS = "StoreSlips"
-DEFAULT_GSHEET_URL = "https://docs.google.com/spreadsheets/d/11l7bawuKdDKhZLGwzN-hxrOer5CNI2oSkJQTPIDlQLc/edit?gid=0#gid=0"
-DEFAULT_PROJECT_GSHEET_NAME = "Factory Store Slip"
-VENDOR_MASTER_COLUMNS = ["Vendor", "Contact", "Address"]
-LOCAL_GSHEETS_CREDENTIALS = Path(__file__).resolve().with_name("credentials.json")
-LAST_GSHEETS_ERROR = ""
-
-INWARD_COLUMNS = [
-    "Date",
-    "Vendor",
-    "Item",
-    "Quantity",
-    "Unit Rate (PKR)",
-    "Total Amount (PKR)",
-    "Payment Terms",
+SEED_USERS = [
+    ("admin", "Administrator", "admin", "admin123"),
+    ("buyer", "Procurement Lead", "procurement", "buyer123"),
+    ("clerk", "Warehouse Clerk", "warehouse", "clerk123"),
+    ("viewer", "Finance Viewer", "viewer", "viewer123"),
 ]
 
-PAYMENT_COLUMNS = [
-    "Voucher No",
-    "Date",
-    "Vendor",
-    "Amount Paid (PKR)",
-    "Payment Mode",
-    "Payment Purpose / Description",
-    "Reference / Notes",
+REQUIRED_TABLES = [
+    "users",
+    "vendors",
+    "items",
+    "vendor_item_rates",
+    "receipts",
+    "inward_lots",
+    "packing_payment_vouchers",
 ]
 
-STORE_STAFF_PAGES = ["Factory Store Slip"]
-ADMIN_PAGES = [
-    "Dashboard",
-    "Factory Store Slip",
-    "Payments & Voucher",
-    "Vendor Bills",
-    "Vendor Ledger",
-    "Vendor Directory",
-    "Items Catalog",
-    "Reports",
-]
+# Keep physical table/column names for historical data compatibility.
+PAYMENT_SLIPS_TABLE = "packing_payment_vouchers"
+PAYMENT_SLIP_TYPE_COLUMN = "packing_reference"
+
+APP_ROOT = Path(__file__).resolve().parent
+LOCAL_DB_PATH = APP_ROOT / "prexa_erp.db"
+LEGACY_LOCAL_DB_PATH = APP_ROOT / "prexa_erp_local.db"
+
+LOCAL_TABLE_SCHEMAS: dict[str, str] = {
+    "users": """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            full_name TEXT NOT NULL,
+            role TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "vendors": """
+        CREATE TABLE IF NOT EXISTS vendors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_code TEXT UNIQUE,
+            vendor_name TEXT NOT NULL,
+            contact_person TEXT,
+            email TEXT,
+            phone TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "items": """
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT UNIQUE,
+            item_name TEXT NOT NULL,
+            unit TEXT,
+            unit_price REAL,
+            stock_on_hand REAL,
+            vendor_id INTEGER,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "vendor_item_rates": """
+        CREATE TABLE IF NOT EXISTS vendor_item_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            unit_rate REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(vendor_id, item_id)
+        )
+    """,
+    "receipts": """
+        CREATE TABLE IF NOT EXISTS receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_number TEXT,
+            receipt_date TEXT,
+            vendor_id INTEGER,
+            item_id INTEGER,
+            quantity REAL,
+            unit_cost REAL,
+            received_by TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "inward_lots": """
+        CREATE TABLE IF NOT EXISTS inward_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_number TEXT,
+            receipt_id INTEGER,
+            vendor_id INTEGER,
+            item_id INTEGER,
+            quantity_received REAL,
+            manufacturing_date TEXT,
+            expiry_date TEXT,
+            qc_status TEXT,
+            warehouse_bin TEXT,
+            notes TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    PAYMENT_SLIPS_TABLE: """
+        CREATE TABLE IF NOT EXISTS packing_payment_vouchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            voucher_number TEXT,
+            voucher_date TEXT,
+            vendor_id INTEGER,
+            amount REAL,
+            tracking_number TEXT,
+            tracking_status TEXT,
+            packing_reference TEXT,
+            operation_notes TEXT,
+            vendor_signature_name TEXT,
+            vendor_signature_date TEXT,
+            approved_by TEXT,
+            remarks TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+}
 
-AUTH_ROLE_ADMIN = "admin"
-AUTH_ROLE_STORE_MANAGER = "store_manager"
 
-SESSION_DATA_CACHE_KEY = "_prexa_session_data_cache"
-LOCAL_OVERRIDE_STATE_KEY = "_prexa_local_override_state"
-STATUS_CACHE_TTL_SECONDS = 30
-VENDOR_CACHE_TTL_SECONDS = 20
-INWARD_CACHE_TTL_SECONDS = 20
-PAYMENT_CACHE_TTL_SECONDS = 20
-SLIP_CACHE_TTL_SECONDS = 15
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-def _ensure_local_backup_dirs() -> None:
-    for backup_dir in (LOCAL_BACKUP_ROOT, VENDOR_BACKUP_DIR, INWARD_BACKUP_DIR, PAYMENT_BACKUP_DIR):
-        backup_dir.mkdir(parents=True, exist_ok=True)
+def ensure_session_state() -> None:
+    st.session_state.setdefault("user", None)
+    st.session_state.setdefault("supabase_url_input", "")
+    st.session_state.setdefault("supabase_key_input", "")
 
 
-def _backup_timestamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-
-
-def _backup_existing_local_file(file_path: Path, backup_dir: Path, prefix: str) -> None:
-    if not file_path.exists() or not file_path.is_file():
-        return
-    _ensure_local_backup_dirs()
-    destination = backup_dir / f"{prefix}_{_backup_timestamp()}_{uuid.uuid4().hex[:8]}.bak"
-    try:
-        shutil.copy2(file_path, destination)
-    except Exception:
-        pass
-
-
-def _write_json_snapshot(backup_dir: Path, prefix: str, payload: object) -> None:
-    _ensure_local_backup_dirs()
-    destination = backup_dir / f"{prefix}_{_backup_timestamp()}_{uuid.uuid4().hex[:8]}.json"
-    try:
-        with open(destination, "w", encoding="utf-8") as backup_file:
-            json.dump(payload, backup_file, indent=2)
-    except Exception:
-        pass
-
-
-def _write_csv_snapshot(backup_dir: Path, prefix: str, df: pd.DataFrame, columns: list[str]) -> None:
-    _ensure_local_backup_dirs()
-    destination = backup_dir / f"{prefix}_{_backup_timestamp()}_{uuid.uuid4().hex[:8]}.csv"
-    snapshot = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=columns)
-    for col in columns:
-        if col not in snapshot.columns:
-            snapshot[col] = ""
-    try:
-        snapshot[columns].to_csv(destination, index=False)
-    except Exception:
-        pass
-
-
-def _persist_vendor_local_backup(vendor_catalog_data: dict, source: str) -> None:
-    _write_json_snapshot(
-        VENDOR_BACKUP_DIR,
-        "vendor_catalog",
-        {
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "source": source,
-            "data": vendor_catalog_data,
-        },
-    )
-    vendor_file = Path(VENDOR_FILE)
-    _backup_existing_local_file(vendor_file, VENDOR_BACKUP_DIR, "vendor_catalog_cache")
-    try:
-        with open(vendor_file, "w", encoding="utf-8") as file_handle:
-            json.dump(vendor_catalog_data, file_handle, indent=2)
-    except Exception:
-        pass
-
-
-def _persist_inward_local_backup(df: pd.DataFrame, source: str) -> None:
-    _write_csv_snapshot(INWARD_BACKUP_DIR, "inward_entries", df, INWARD_COLUMNS)
-    _write_json_snapshot(
-        INWARD_BACKUP_DIR,
-        "inward_metadata",
-        {
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "source": source,
-            "row_count": int(len(df.index)) if isinstance(df, pd.DataFrame) else 0,
-        },
-    )
-    inward_file = Path(INWARD_FILE)
-    _backup_existing_local_file(inward_file, INWARD_BACKUP_DIR, "inward_cache")
-    try:
-        local_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=INWARD_COLUMNS)
-        for col in INWARD_COLUMNS:
-            if col not in local_df.columns:
-                local_df[col] = ""
-        local_df[INWARD_COLUMNS].to_csv(inward_file, index=False)
-    except Exception:
-        pass
-
-
-def _persist_payment_local_backup(df: pd.DataFrame, source: str) -> None:
-    _write_csv_snapshot(PAYMENT_BACKUP_DIR, "payments", df, PAYMENT_COLUMNS)
-    _write_json_snapshot(
-        PAYMENT_BACKUP_DIR,
-        "payment_metadata",
-        {
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "source": source,
-            "row_count": int(len(df.index)) if isinstance(df, pd.DataFrame) else 0,
-        },
-    )
-    payment_file = Path(PAYMENT_FILE)
-    _backup_existing_local_file(payment_file, PAYMENT_BACKUP_DIR, "payment_cache")
-    try:
-        local_df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=PAYMENT_COLUMNS)
-        for col in PAYMENT_COLUMNS:
-            if col not in local_df.columns:
-                local_df[col] = ""
-        local_df[PAYMENT_COLUMNS].to_csv(payment_file, index=False)
-    except Exception:
-        pass
-
-
-def _secrets_section(name: str) -> dict:
-    try:
-        section = st.secrets[name]
-        return dict(section)
-    except Exception:
-        return {}
-
-
-def _ensure_session_data_cache() -> dict:
-    cache_store = st.session_state.get(SESSION_DATA_CACHE_KEY)
-    if not isinstance(cache_store, dict):
-        cache_store = {}
-        st.session_state[SESSION_DATA_CACHE_KEY] = cache_store
-    return cache_store
-
-
-def _clone_cache_value(value):
-    if isinstance(value, pd.DataFrame):
-        return value.copy(deep=True)
-    if isinstance(value, (dict, list, tuple, set)):
-        return deepcopy(value)
-    return value
-
-
-def _get_session_cached_value(cache_key: str, ttl_seconds: int):
-    cache_store = _ensure_session_data_cache()
-    entry = cache_store.get(cache_key)
-    if not isinstance(entry, dict):
-        return None
-
-    cached_at = float(entry.get("cached_at", 0.0))
-    if cached_at <= 0.0 or (time.time() - cached_at) > float(ttl_seconds):
-        cache_store.pop(cache_key, None)
-        return None
-
-    return _clone_cache_value(entry.get("value"))
-
-
-def _set_session_cached_value(cache_key: str, value) -> None:
-    cache_store = _ensure_session_data_cache()
-    cache_store[cache_key] = {
-        "cached_at": time.time(),
-        "value": _clone_cache_value(value),
-    }
-
-
-def _clear_session_data_cache() -> None:
-    st.session_state.pop(SESSION_DATA_CACHE_KEY, None)
-
-
-def _ensure_local_override_state() -> dict:
-    state = st.session_state.get(LOCAL_OVERRIDE_STATE_KEY)
-    if not isinstance(state, dict):
-        state = {}
-        st.session_state[LOCAL_OVERRIDE_STATE_KEY] = state
-    return state
-
-
-def _set_local_override(dataset_key: str, enabled: bool) -> None:
-    state = _ensure_local_override_state()
-    state[str(dataset_key)] = bool(enabled)
-
-
-def _is_local_override_enabled(dataset_key: str) -> bool:
-    state = _ensure_local_override_state()
-    return bool(state.get(str(dataset_key), False))
-
-
-def _gsheet_target() -> str:
-    gs = _secrets_section("gsheets")
-    return str(gs.get("spreadsheet") or gs.get("url") or gs.get("id") or DEFAULT_GSHEET_URL).strip()
-
-
-def _gsheet_name() -> str:
-    gs = _secrets_section("gsheets")
-    return str(gs.get("name") or gs.get("spreadsheet_name") or gs.get("title") or DEFAULT_PROJECT_GSHEET_NAME).strip()
-
-
-def is_google_sheets_configured() -> bool:
-    return bool(_gsheet_target()) and (
-        LOCAL_GSHEETS_CREDENTIALS.exists() or bool(_secrets_section("gcp_service_account"))
-    )
-
-
-def has_google_service_account() -> bool:
-    return LOCAL_GSHEETS_CREDENTIALS.exists() or bool(_secrets_section("gcp_service_account"))
-
-
-def _google_credentials_path() -> Optional[Path]:
-    if LOCAL_GSHEETS_CREDENTIALS.exists():
-        return LOCAL_GSHEETS_CREDENTIALS
-
-    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
-    if env_path:
-        candidate = Path(env_path).expanduser()
-        if candidate.exists():
-            return candidate
-
-    return None
-
-
-def _sheet_key_from_target(target: str) -> str:
-    value = str(target or "").strip()
-    if not value:
-        return ""
-    if value.startswith("http") and "/d/" in value:
-        try:
-            return value.split("/d/", 1)[1].split("/", 1)[0].strip()
-        except Exception:
-            return ""
-    if "/" not in value and len(value) >= 30:
-        return value
-    return ""
-
-
-def _public_sheet_key() -> str:
-    return _sheet_key_from_target(_gsheet_target())
-
-
-def _public_sheet_gid(sheet_name: str) -> Optional[str]:
-    gs = _secrets_section("gsheets")
-    gids = _secrets_section("gsheets_gids")
-
-    direct = gs.get(f"{sheet_name}_gid")
-    if direct is not None and str(direct).strip() != "":
-        return str(direct).strip()
-
-    mapped = gids.get(sheet_name)
-    if mapped is not None and str(mapped).strip() != "":
-        return str(mapped).strip()
-
-    generic = gs.get("gid")
-    if generic is not None and str(generic).strip() != "":
-        return str(generic).strip()
-
-    target = _gsheet_target()
-    if target.startswith("http"):
-        try:
-            parsed = urlparse(target)
-            parsed_gid = parse_qs(parsed.query).get("gid", [""])[0].strip()
-            if parsed_gid:
-                return parsed_gid
-        except Exception:
-            pass
-
-    # Most Google Sheet links open first tab by default.
-    return "0"
-
-
-@st.cache_data(show_spinner=False, ttl=120)
-def _read_public_sheet_csv(sheet_key: str, gid: str) -> Optional[pd.DataFrame]:
-    if not sheet_key or gid is None:
-        return None
-
-    csv_urls = [
-        f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&gid={gid}",
-        f"https://docs.google.com/spreadsheets/d/{sheet_key}/export?format=csv&single=true&gid={gid}",
-        f"https://docs.google.com/spreadsheets/d/{sheet_key}/gviz/tq?tqx=out:csv&gid={gid}",
-    ]
-
-    for csv_url in csv_urls:
-        try:
-            return pd.read_csv(csv_url)
-        except pd.errors.EmptyDataError:
-            # Empty public sheet/tab is still a valid reachable sheet.
-            return pd.DataFrame()
-        except Exception:
-            continue
-
-    return None
-
-
-@st.cache_data(show_spinner=False, ttl=120)
-def _read_public_sheet_by_name(sheet_key: str, sheet_name: str) -> Optional[pd.DataFrame]:
-    if not sheet_key or not sheet_name:
-        return None
-    csv_url = (
-        f"https://docs.google.com/spreadsheets/d/{sheet_key}/gviz/tq"
-        f"?tqx=out:csv&sheet={quote(sheet_name)}"
-    )
-    try:
-        return pd.read_csv(csv_url)
-    except pd.errors.EmptyDataError:
-        return pd.DataFrame()
-    except Exception:
-        return None
-
-
-def _public_sheet_to_df(name: str, headers: list[str]) -> Optional[pd.DataFrame]:
-    sheet_key = _public_sheet_key()
-    gid = _public_sheet_gid(name)
-    if not sheet_key:
-        return None
-
-    df = _read_public_sheet_csv(sheet_key, gid) if gid is not None else None
-    if df is None:
-        df = _read_public_sheet_by_name(sheet_key, name)
-    if df is None:
-        return None
-
-    for col in headers:
-        if col not in df.columns:
-            df[col] = ""
-
-    ordered = [col for col in headers if col in df.columns]
-    extras = [col for col in df.columns if col not in ordered]
-    return df[ordered + extras]
-
-
-@st.cache_data(show_spinner=False, ttl=120)
-def _public_sheet_ping(sheet_key: str, gid: str) -> bool:
-    if not sheet_key or gid is None:
+def require_role(section: str) -> bool:
+    user = st.session_state.get("user")
+    if not user:
         return False
-    return _read_public_sheet_csv(sheet_key, gid) is not None
+    return section in ROLE_PERMISSIONS.get(user["role"], set())
 
 
-@st.cache_data(show_spinner=False, ttl=120)
-def _public_sheet_ping_by_name(sheet_key: str, sheet_name: str) -> bool:
-    if not sheet_key or not sheet_name:
-        return False
-    return _read_public_sheet_by_name(sheet_key, sheet_name) is not None
+def resolve_supabase_credentials() -> tuple[str, str]:
+    env_url = os.getenv("SUPABASE_URL", "").strip()
+    env_key = os.getenv("SUPABASE_ANON_KEY", "").strip()
 
-
-def google_sheets_write_enabled() -> bool:
-    return _get_gspread_spreadsheet() is not None
-
-
-def _has_non_empty_sheet_values(values) -> bool:
-    if values is None:
-        return False
-    if not isinstance(values, list):
-        return True
-    if len(values) == 0:
-        return False
-
-    for row in values:
-        if isinstance(row, list):
-            if any(str(cell).strip() != "" for cell in row):
-                return True
-        elif str(row).strip() != "":
-            return True
-    return False
-
-
-def _safe_batch_update(spreadsheet, body: dict, context: str) -> bool:
-    requests = body.get("requests") if isinstance(body, dict) else None
-    if requests is not None and isinstance(requests, list) and len(requests) == 0:
-        return True
-    if not isinstance(body, dict) or len(body) == 0:
-        return True
-
+    secret_url = ""
+    secret_key = ""
     try:
-        spreadsheet.batch_update(body)
-        return True
-    except Exception as exc:
-        _record_gsheets_exception(context, exc)
-        return False
+        # Access to st.secrets can raise StreamlitSecretNotFoundError when
+        # secrets.toml is absent; fall through to other credential sources.
+        secrets_obj = st.secrets
+        secret_url = str(secrets_obj.get("SUPABASE_URL", "")).strip()
+        secret_key = str(secrets_obj.get("SUPABASE_ANON_KEY", "")).strip()
+    except Exception:
+        secret_url = ""
+        secret_key = ""
+
+    input_url = st.session_state.get("supabase_url_input", "").strip()
+    input_key = st.session_state.get("supabase_key_input", "").strip()
+
+    url = input_url or env_url or secret_url
+    key = input_key or env_key or secret_key
+    return url, key
 
 
-def _safe_worksheet_update(
-    worksheet,
-    cell_range: str,
-    values,
-    *,
-    context: str,
-    value_input_option: Optional[str] = None,
-) -> bool:
-    if not _has_non_empty_sheet_values(values):
-        return True
+class LocalResult:
+    def __init__(self, data: list[dict[str, Any]]):
+        self.data = data
 
-    try:
-        if value_input_option:
-            worksheet.update(cell_range, values, value_input_option=value_input_option)
+
+class LocalQuery:
+    def __init__(self, client: "LocalClient", table_name: str):
+        self.client = client
+        self.table_name = table_name
+        self.operation = "select"
+        self.selected_columns: list[str] | None = None
+        self.filters: list[tuple[str, Any]] = []
+        self.orders: list[tuple[str, bool]] = []
+        self.limit_count: int | None = None
+        self.payload: Any = None
+        self.on_conflict: str | None = None
+
+    def select(self, columns: str = "*", count: str | None = None) -> "LocalQuery":
+        _ = count
+        self.operation = "select"
+        if columns and columns != "*":
+            self.selected_columns = [col.strip() for col in columns.split(",")]
         else:
-            worksheet.update(cell_range, values)
+            self.selected_columns = None
+        return self
+
+    def insert(self, payload: dict[str, Any] | list[dict[str, Any]]) -> "LocalQuery":
+        self.operation = "insert"
+        self.payload = payload
+        return self
+
+    def upsert(self, payload: list[dict[str, Any]], on_conflict: str) -> "LocalQuery":
+        self.operation = "upsert"
+        self.payload = payload
+        self.on_conflict = on_conflict
+        return self
+
+    def update(self, payload: dict[str, Any]) -> "LocalQuery":
+        self.operation = "update"
+        self.payload = payload
+        return self
+
+    def delete(self) -> "LocalQuery":
+        self.operation = "delete"
+        return self
+
+    def eq(self, column: str, value: Any) -> "LocalQuery":
+        self.filters.append((column, value))
+        return self
+
+    def order(self, column: str, desc: bool = False) -> "LocalQuery":
+        self.orders.append((column, desc))
+        return self
+
+    def limit(self, count: int) -> "LocalQuery":
+        self.limit_count = count
+        return self
+
+    def _match(self, row: dict[str, Any]) -> bool:
+        for column, value in self.filters:
+            if row.get(column) != value:
+                return False
         return True
-    except Exception as exc:
-        _record_gsheets_exception(context, exc)
-        return False
+
+    def _apply_select_shape(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not self.selected_columns:
+            return [dict(row) for row in rows]
+        shaped: list[dict[str, Any]] = []
+        for row in rows:
+            shaped.append({column: row.get(column) for column in self.selected_columns})
+        return shaped
+
+    def _select_sql(self) -> tuple[str, list[Any]]:
+        columns = "*" if not self.selected_columns else ", ".join(self.selected_columns)
+        sql = f"SELECT {columns} FROM {self.table_name}"
+        params: list[Any] = []
+        if self.filters:
+            where_parts = []
+            for column, value in self.filters:
+                where_parts.append(f"{column} = ?")
+                params.append(value)
+            sql += " WHERE " + " AND ".join(where_parts)
+        if self.orders:
+            order_parts = [f"{column} {'DESC' if desc else 'ASC'}" for column, desc in self.orders]
+            sql += " ORDER BY " + ", ".join(order_parts)
+        if self.limit_count is not None:
+            sql += " LIMIT ?"
+            params.append(self.limit_count)
+        return sql, params
+
+    def _insert_sql(self, row: dict[str, Any]) -> tuple[str, list[Any]]:
+        payload = dict(row)
+        if "created_at" not in payload:
+            payload["created_at"] = datetime.now().isoformat(timespec="seconds")
+        columns = list(payload.keys())
+        placeholders = ", ".join(["?" for _ in columns])
+        sql = f"INSERT INTO {self.table_name} ({', '.join(columns)}) VALUES ({placeholders})"
+        params = [payload[column] for column in columns]
+        return sql, params
+
+    def _upsert_sql(self, row: dict[str, Any], conflict_col: str) -> tuple[str, list[Any]]:
+        payload = dict(row)
+        if "created_at" not in payload:
+            payload["created_at"] = datetime.now().isoformat(timespec="seconds")
+        columns = list(payload.keys())
+        placeholders = ", ".join(["?" for _ in columns])
+        update_cols = [column for column in columns if column != conflict_col]
+        update_expr = ", ".join([f"{column}=excluded.{column}" for column in update_cols])
+        sql = (
+            f"INSERT INTO {self.table_name} ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT({conflict_col}) DO UPDATE SET {update_expr}"
+        )
+        params = [payload[column] for column in columns]
+        return sql, params
+
+    def _update_sql(self) -> tuple[str, list[Any]]:
+        payload = dict(self.payload)
+        set_columns = list(payload.keys())
+        sql = f"UPDATE {self.table_name} SET " + ", ".join([f"{column} = ?" for column in set_columns])
+        params: list[Any] = [payload[column] for column in set_columns]
+        if self.filters:
+            where_parts = []
+            for column, value in self.filters:
+                where_parts.append(f"{column} = ?")
+                params.append(value)
+            sql += " WHERE " + " AND ".join(where_parts)
+        return sql, params
+
+    def _delete_sql(self) -> tuple[str, list[Any]]:
+        sql = f"DELETE FROM {self.table_name}"
+        params: list[Any] = []
+        if self.filters:
+            where_parts = []
+            for column, value in self.filters:
+                where_parts.append(f"{column} = ?")
+                params.append(value)
+            sql += " WHERE " + " AND ".join(where_parts)
+        return sql, params
+
+    def execute(self) -> LocalResult:
+        with self.client.get_connection() as conn:
+            cursor = conn.cursor()
+
+            if self.operation == "insert":
+                payload_rows = self.payload if isinstance(self.payload, list) else [self.payload]
+                inserted: list[dict[str, Any]] = []
+                for payload_row in payload_rows:
+                    sql, params = self._insert_sql(payload_row)
+                    cursor.execute(sql, params)
+                    row_id = cursor.lastrowid
+                    selected = conn.execute(f"SELECT * FROM {self.table_name} WHERE id = ?", (row_id,)).fetchone()
+                    inserted.append(dict(selected) if selected else {})
+                conn.commit()
+                return LocalResult(inserted)
+
+            if self.operation == "upsert":
+                conflict_col = self.on_conflict or "id"
+                upserted: list[dict[str, Any]] = []
+                for payload_row in self.payload:
+                    sql, params = self._upsert_sql(payload_row, conflict_col)
+                    cursor.execute(sql, params)
+                    selected = conn.execute(
+                        f"SELECT * FROM {self.table_name} WHERE {conflict_col} = ? LIMIT 1",
+                        (payload_row.get(conflict_col),),
+                    ).fetchone()
+                    upserted.append(dict(selected) if selected else {})
+                conn.commit()
+                return LocalResult(upserted)
+
+            if self.operation == "update":
+                before_sql, before_params = self._select_sql()
+                rows_before = [dict(row) for row in conn.execute(before_sql, before_params).fetchall()]
+                update_sql, update_params = self._update_sql()
+                cursor.execute(update_sql, update_params)
+                conn.commit()
+                return LocalResult(rows_before)
+
+            if self.operation == "delete":
+                before_sql, before_params = self._select_sql()
+                rows_before = [dict(row) for row in conn.execute(before_sql, before_params).fetchall()]
+                delete_sql, delete_params = self._delete_sql()
+                cursor.execute(delete_sql, delete_params)
+                conn.commit()
+                return LocalResult(rows_before)
+
+            select_sql, select_params = self._select_sql()
+            selected = [dict(row) for row in conn.execute(select_sql, select_params).fetchall()]
+            return LocalResult(selected)
 
 
-def _safe_append_row(worksheet, row_values: list[object], *, context: str, value_input_option: str = "USER_ENTERED") -> bool:
-    normalized = ["" if value is None else value for value in row_values]
-    if all(str(value).strip() == "" for value in normalized):
-        return True
+class LocalClient:
+    backend_name = "local"
 
-    try:
-        worksheet.append_row(normalized, value_input_option=value_input_option)
-        return True
-    except Exception as exc:
-        _record_gsheets_exception(context, exc)
-        return False
+    def __init__(self) -> None:
+        self.db_path = LOCAL_DB_PATH
+        self._migrate_legacy_db_if_needed()
+        self._ensure_schema()
 
+    def table(self, table_name: str) -> LocalQuery:
+        if table_name not in REQUIRED_TABLES:
+            raise ValueError(f"Unknown table requested: {table_name}")
+        return LocalQuery(self, table_name)
 
-def _refresh_app_data_after_submit() -> None:
-    _clear_session_data_cache()
-    _get_gspread_spreadsheet.clear()
-    _public_sheet_ping.clear()
-    _public_sheet_ping_by_name.clear()
-    _read_public_sheet_csv.clear()
-    _read_public_sheet_by_name.clear()
-    st.rerun()
+    def _ensure_schema(self) -> None:
+        with self.get_connection() as conn:
+            for ddl in LOCAL_TABLE_SCHEMAS.values():
+                conn.execute(ddl)
+            conn.commit()
 
+    def _migrate_legacy_db_if_needed(self) -> None:
+        # One-time safety migration so existing local data is retained.
+        if not self.db_path.exists() and LEGACY_LOCAL_DB_PATH.exists():
+            shutil.copy2(LEGACY_LOCAL_DB_PATH, self.db_path)
 
-def _open_spreadsheet_with_fallback(client, target: str, sheet_name: str):
-    target_value = str(target or "").strip()
-    name_value = str(sheet_name or "").strip()
-    target_key = _sheet_key_from_target(target_value)
-
-    attempts: list[tuple[str, object]] = []
-    if target_value.startswith("http"):
-        attempts.append((f"URL '{target_value}'", lambda: client.open_by_url(target_value)))
-    if target_key:
-        attempts.append((f"key '{target_key}'", lambda: client.open_by_key(target_key)))
-    if name_value:
-        attempts.append((f"name '{name_value}'", lambda: client.open(name_value)))
-    if target_value and not target_value.startswith("http") and not target_key:
-        attempts.append((f"name '{target_value}'", lambda: client.open(target_value)))
-
-    attempted_labels = []
-    seen_labels = set()
-    last_error = None
-    for label, opener in attempts:
-        if label in seen_labels:
-            continue
-        seen_labels.add(label)
-        attempted_labels.append(label)
-        try:
-            return opener()
-        except Exception as exc:
-            last_error = exc
-
-    attempts_text = ", ".join(attempted_labels) if attempted_labels else "no targets"
-    if last_error is not None:
-        raise RuntimeError(f"Unable to open Google Sheet using {attempts_text}. Last error: {last_error}") from last_error
-    raise RuntimeError(f"Unable to open Google Sheet using {attempts_text}.")
+    def get_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.db_path), timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        return connection
 
 
 @st.cache_resource(show_spinner=False)
-def _get_gspread_spreadsheet():
-    if gspread is None or Credentials is None:
-        return None
+def build_supabase_client(url: str, key: str) -> SupabaseClient:
+    if create_client is None:
+        raise RuntimeError("supabase package is not installed")
+    return create_client(url, key)
 
-    target = _gsheet_target()
-    sheet_name = _gsheet_name()
-    if not target:
-        return None
+
+def get_supabase_client() -> tuple[SupabaseClient, str]:
+    url, key = resolve_supabase_credentials()
+    if not url or not key:
+        return LocalClient(), "Local mode (no Supabase credentials configured)"
+
+    if create_client is None:
+        return LocalClient(), "Local mode (supabase package unavailable)"
 
     try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        service_account_info: dict = {}
-        credentials_path = _google_credentials_path()
-        if credentials_path is not None:
-            with open(credentials_path, "r", encoding="utf-8") as credentials_file:
-                service_account_info = json.load(credentials_file)
-            creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-        else:
-            service_account_info = _secrets_section("gcp_service_account")
-            if not service_account_info:
-                return None
-            creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-
-        client = gspread.authorize(creds)
-
-        spreadsheet = _open_spreadsheet_with_fallback(client, target, sheet_name)
-
-        # Light connectivity probe; avoids invalid empty batch_update requests.
-        _ = spreadsheet.title
-        return spreadsheet
-
+        client = build_supabase_client(url, key)
+        return client, "Connected to Supabase"
     except Exception as exc:
-        account_email = _service_account_email_from_info(service_account_info)
-        share_hint = ""
-        if account_email:
-            share_hint = f" Share this Google Sheet with Editor access to: {account_email}"
-        details = _record_gsheets_exception("google sheets connect", RuntimeError(f"{exc}.{share_hint}"))
-        if os.environ.get("GSHEETS_RAISE_ON_CONNECT_ERROR", "").strip().lower() in {"1", "true", "yes"}:
-            raise RuntimeError(details) from exc
-        return None
+        return LocalClient(), f"Local mode (Supabase connection failed: {exc})"
 
 
-def using_google_sheets() -> bool:
-    spreadsheet = _get_gspread_spreadsheet()
-    if spreadsheet is not None:
-        return True
-
-    # Recover from a stale cached failure in long-running Streamlit sessions.
-    if has_google_service_account():
-        _get_gspread_spreadsheet.clear()
-        return _get_gspread_spreadsheet() is not None
-
-    return False
-
-
-def google_sheets_status() -> tuple[bool, str]:
-    cached_status = _get_session_cached_value("gsheets_status", STATUS_CACHE_TTL_SECONDS)
-    if isinstance(cached_status, tuple) and len(cached_status) == 2:
-        return bool(cached_status[0]), str(cached_status[1])
-
-    status: tuple[bool, str]
-    spreadsheet = _get_gspread_spreadsheet()
-    if spreadsheet is not None:
+def check_supabase_schema(client: SupabaseClient) -> tuple[bool, str]:
+    missing: list[str] = []
+    for table_name in REQUIRED_TABLES:
         try:
-            status = (True, f"Connected (read/write): {spreadsheet.title}")
+            client.table(table_name).select("id", count="exact").limit(1).execute()
         except Exception:
-            status = (True, "Connected (read/write) to Google Sheets")
-        _set_session_cached_value("gsheets_status", status)
-        return status
+            missing.append(table_name)
 
-    sheet_key = _public_sheet_key()
-    public_gid = _public_sheet_gid(WS_INWARD)
-    if sheet_key:
-        if public_gid is not None and _public_sheet_ping(sheet_key, public_gid):
-            status = (True, "Connected (public read-only mode)")
-            _set_session_cached_value("gsheets_status", status)
-            return status
-        if _public_sheet_ping_by_name(sheet_key, WS_INWARD):
-            status = (True, "Connected (public read-only mode)")
-            _set_session_cached_value("gsheets_status", status)
-            return status
-
-    if has_google_service_account():
-        status = (False, "Service account configured, but sheet access failed. Check share permissions.")
-        _set_session_cached_value("gsheets_status", status)
-        return status
-
-    if sheet_key:
-        status = (False, "Public sheet configured but not accessible yet (publish/share or check gid).")
-        _set_session_cached_value("gsheets_status", status)
-        return status
-
-    status = (False, "Google Sheets not configured. Running with local storage fallback.")
-    _set_session_cached_value("gsheets_status", status)
-    return status
+    if missing:
+        return False, f"Missing or inaccessible Supabase tables: {', '.join(missing)}"
+    return True, "Supabase schema is ready."
 
 
-def _admin_pin_value() -> str:
-    auth_section = _secrets_section("auth")
-    return str(
-        auth_section.get("admin_pin")
-        or os.environ.get("PREXA_ADMIN_PIN")
-        or DEFAULT_ADMIN_PIN
-    ).strip()
+def seed_users(client: SupabaseClient) -> None:
+    payload = [
+        {
+            "username": username,
+            "full_name": full_name,
+            "role": role,
+            "password_hash": hash_password(password),
+        }
+        for username, full_name, role, password in SEED_USERS
+    ]
 
-
-def _initialize_auth_session() -> None:
-    st.session_state.setdefault("authenticated_role", "")
-    st.session_state.setdefault("app_selected_page", "Factory Store Slip")
-
-
-def _current_authenticated_role() -> str:
-    return str(st.session_state.get("authenticated_role", "")).strip()
-
-
-def _set_authenticated_role(role: str) -> None:
-    st.session_state.authenticated_role = role
-    st.session_state.app_selected_page = "Factory Store Slip"
-    st.session_state.pop("admin_pin_input", None)
-
-
-def _logout_current_user() -> None:
-    st.session_state.authenticated_role = ""
-    st.session_state.app_selected_page = "Factory Store Slip"
-    st.session_state.pop("admin_pin_input", None)
-
-
-def _safe_float(value, default=0.0) -> float:
     try:
-        return float(value)
+        client.table("users").upsert(payload, on_conflict="username").execute()
     except Exception:
-        return default
-
-
-def _record_gsheets_exception(context: str, exc: Exception) -> str:
-    global LAST_GSHEETS_ERROR
-    trace = traceback.format_exc()
-    LAST_GSHEETS_ERROR = f"[{context}] {exc}\n{trace}"
-    print(LAST_GSHEETS_ERROR)
-    return LAST_GSHEETS_ERROR
-
-
-def _last_gsheets_error() -> str:
-    return LAST_GSHEETS_ERROR
-
-
-def _service_account_email_from_info(info: dict) -> str:
-    try:
-        return str(info.get("client_email", "")).strip()
-    except Exception:
-        return ""
-
-
-def _get_or_create_worksheet(name: str, headers: list[str]):
-    spreadsheet = _get_gspread_spreadsheet()
-    if spreadsheet is None:
-        return None
-
-    try:
-        worksheet = spreadsheet.worksheet(name)
-    except Exception as exc:
-        _record_gsheets_exception(f"worksheet lookup: {name}", exc)
-        try:
-            worksheet = spreadsheet.add_worksheet(title=name, rows="2000", cols=str(max(20, len(headers) + 4)))
-            _safe_worksheet_update(worksheet, "A1", [headers], context=f"worksheet create header: {name}")
-        except Exception as add_exc:
-            _record_gsheets_exception(f"worksheet create: {name}", add_exc)
-            return None
-
-    return worksheet
-
-
-def _sheet_to_df(name: str, headers: list[str]) -> pd.DataFrame:
-    worksheet = _get_or_create_worksheet(name, headers)
-    if worksheet is None:
-        return pd.DataFrame(columns=headers)
-
-    try:
-        values = worksheet.get_all_values()
-    except Exception:
-        return pd.DataFrame(columns=headers)
-
-    if not values:
-        try:
-            _safe_worksheet_update(worksheet, "A1", [headers], context=f"sheet init header: {name}")
-        except Exception:
-            pass
-        return pd.DataFrame(columns=headers)
-
-    sheet_headers = [str(col).strip() for col in values[0]]
-    if not any(sheet_headers):
-        try:
-            _safe_worksheet_update(worksheet, "A1", [headers], context=f"sheet reset header: {name}")
-        except Exception:
-            pass
-        return pd.DataFrame(columns=headers)
-
-    rows = values[1:] if len(values) > 1 else []
-    if not rows:
-        df = pd.DataFrame(columns=sheet_headers)
-    else:
-        row_width = len(sheet_headers)
-        normalized_rows = [row + [""] * (row_width - len(row)) for row in rows]
-        df = pd.DataFrame(normalized_rows, columns=sheet_headers)
-
-    for col in headers:
-        if col not in df.columns:
-            df[col] = ""
-
-    ordered = [col for col in headers if col in df.columns]
-    extras = [col for col in df.columns if col not in ordered]
-    return df[ordered + extras]
-
-
-def _df_to_sheet(name: str, df: pd.DataFrame, headers: list[str]) -> bool:
-    worksheet = _get_or_create_worksheet(name, headers)
-    if worksheet is None:
-        return False
-
-    out = df.copy()
-    for col in headers:
-        if col not in out.columns:
-            out[col] = ""
-    out = out[headers].fillna("")
-
-    values = [headers]
-    if not out.empty:
-        values.extend(out.astype(str).values.tolist())
-
-    try:
-        worksheet.clear()
-        if not _safe_worksheet_update(worksheet, "A1", values, context=f"sheet write: {name}"):
-            return False
-        return True
-    except Exception as exc:
-        _record_gsheets_exception(f"sheet write: {name}", exc)
-        return False
-
-
-def _write_sheet_with_retry(name: str, df: pd.DataFrame, headers: list[str], retries: int = 1) -> bool:
-    attempts = max(1, retries + 1)
-    for attempt in range(attempts):
-        if _df_to_sheet(name, df, headers):
-            return True
-        if attempt < attempts - 1:
-            _get_gspread_spreadsheet.clear()
-    return False
-
-
-def _append_sheet_row(name: str, headers: list[str], row_values: list[object]) -> tuple[bool, str]:
-    worksheet = _get_or_create_worksheet(name, headers)
-    if worksheet is None:
-        return False, f"Worksheet '{name}' could not be opened or created."
-
-    try:
-        existing_headers = worksheet.row_values(1)
-    except Exception:
-        existing_headers = []
-
-    if [str(col).strip() for col in existing_headers] != headers:
-        try:
-            if not _safe_worksheet_update(worksheet, "A1", [headers], context=f"header sync: {name}"):
-                return False, f"Worksheet '{name}' header update failed."
-        except Exception as exc:
-            _record_gsheets_exception(f"header sync: {name}", exc)
-            return False, f"Worksheet '{name}' header update failed."
-
-    try:
-        if not _safe_append_row(worksheet, row_values, context=f"append row: {name}", value_input_option="USER_ENTERED"):
-            return False, "Google Sheets append failed."
-        return True, f"Vendor saved to Google Sheets tab '{name}'."
-    except Exception as exc:
-        _record_gsheets_exception(f"append row: {name}", exc)
-        return False, f"Google Sheets append failed: {exc}"
-
-
-def append_vendor_master_record(vendor: str, contact: str = "", address: str = "") -> tuple[bool, str]:
-    if not google_sheets_write_enabled():
-        return False, "Google Sheets write access is not available."
-
-    return _append_sheet_row(
-        WS_VENDOR_MASTER,
-        VENDOR_MASTER_COLUMNS,
-        [vendor.strip(), contact.strip(), address.strip()],
-    )
-
-
-def _normalize_vendor_catalog_df(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=VENDOR_COLUMNS)
-
-    normalized = df.copy()
-    rename_map: dict[str, str] = {}
-    for column in normalized.columns:
-        key = str(column).strip().lower()
-        if key == "vendor":
-            rename_map[column] = "Vendor"
-        elif key == "item":
-            rename_map[column] = "Item"
-        elif key == "rate":
-            rename_map[column] = "Rate"
-
-    if rename_map:
-        normalized = normalized.rename(columns=rename_map)
-
-    for required in VENDOR_COLUMNS:
-        if required not in normalized.columns:
-            normalized[required] = ""
-
-    return normalized[VENDOR_COLUMNS]
-
-
-def _vendor_catalog_rows(vendor_catalog_data: dict) -> list[list[object]]:
-    rows: list[list[object]] = []
-    for vendor_name, items in vendor_catalog_data.items():
-        vendor = str(vendor_name).strip()
-        if not vendor:
-            continue
-        if not items:
-            rows.append([vendor, "", ""])
-            continue
-        for item_name, item_rate in items.items():
-            item = str(item_name).strip()
-            if not item:
-                continue
-            rows.append([vendor, item, item_rate])
-    return rows
-
-
-def _vendor_names_from_catalog(vendor_catalog_data: dict) -> list[str]:
-    vendor_names: list[str] = []
-    seen: set[str] = set()
-    for vendor_name in vendor_catalog_data.keys():
-        vendor = str(vendor_name).strip()
-        if not vendor:
-            continue
-        vendor_key = vendor.casefold()
-        if vendor_key in seen:
-            continue
-        seen.add(vendor_key)
-        vendor_names.append(vendor)
-    return vendor_names
-
-
-def _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data: dict) -> None:
-    existing_values = worksheet.get_all_values()
-    if not existing_values:
-        _safe_worksheet_update(worksheet, "A1", [VENDOR_COLUMNS], context="vendor catalog header init")
-        existing_values = [VENDOR_COLUMNS]
-
-    raw_header = [str(col).strip() for col in existing_values[0]]
-    header_lower = [col.lower() for col in raw_header]
-    if not {"vendor", "item", "rate"}.issubset(set(header_lower)):
-        _safe_worksheet_update(worksheet, "A1:C1", [VENDOR_COLUMNS], context="vendor catalog header reset")
-        raw_header = VENDOR_COLUMNS
-        header_lower = ["vendor", "item", "rate"]
-
-    vendor_idx = header_lower.index("vendor")
-    item_idx = header_lower.index("item")
-    rate_idx = header_lower.index("rate")
-
-    existing_row_by_key: dict[tuple[str, str], int] = {}
-    for row_number, row in enumerate(existing_values[1:], start=2):
-        vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
-        item = str(row[item_idx]).strip() if item_idx < len(row) else ""
-        if not vendor:
-            continue
-        existing_row_by_key[(vendor.casefold(), item.casefold())] = row_number
-
-    for vendor, item, rate in _vendor_catalog_rows(vendor_catalog_data):
-        key = (vendor.casefold(), item.casefold())
-        payload = [vendor, item, rate]
-        if key in existing_row_by_key:
-            row_number = existing_row_by_key[key]
-            _safe_worksheet_update(
-                worksheet,
-                f"A{row_number}:C{row_number}",
-                [payload],
-                context="vendor catalog row update",
-                value_input_option="USER_ENTERED",
-            )
-        else:
-            _safe_append_row(worksheet, payload, context="vendor catalog row append", value_input_option="USER_ENTERED")
-
-
-def _normalize_sheet_header(value: object) -> str:
-    text = str(value or "").replace("\ufeff", "")
-    return " ".join(text.strip().split()).casefold()
-
-
-def _upsert_vendor_master_sheet(
-    worksheet,
-    vendor_names: list[str],
-    contact: str = "",
-    address: str = "",
-) -> None:
-    names = [str(name).strip() for name in vendor_names if str(name).strip()]
-    if not names:
-        return
-
-    values = worksheet.get_all_values()
-    if not values:
-        _safe_worksheet_update(worksheet, "A1", [VENDOR_MASTER_COLUMNS], context="vendor master header init")
-        values = [VENDOR_MASTER_COLUMNS]
-
-    raw_header = [str(col).strip() for col in values[0]]
-    header_map = {_normalize_sheet_header(col): idx for idx, col in enumerate(raw_header) if str(col).strip()}
-    vendor_idx = header_map.get("vendor")
-    contact_idx = header_map.get("contact")
-    address_idx = header_map.get("address")
-
-    if vendor_idx is None:
-        _safe_worksheet_update(worksheet, "A1:C1", [VENDOR_MASTER_COLUMNS], context="vendor master header reset")
-        raw_header = VENDOR_MASTER_COLUMNS
-        vendor_idx, contact_idx, address_idx = 0, 1, 2
-
-    existing_row_by_vendor: dict[str, int] = {}
-    for row_number, row in enumerate(values[1:], start=2):
-        existing_vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
-        if existing_vendor:
-            existing_row_by_vendor[existing_vendor.casefold()] = row_number
-
-    for vendor in names:
-        key = vendor.casefold()
-        row_payload = [vendor, contact.strip(), address.strip()]
-        if key in existing_row_by_vendor:
-            row_number = existing_row_by_vendor[key]
-            if contact.strip() or address.strip():
-                _safe_worksheet_update(
-                    worksheet,
-                    f"A{row_number}:C{row_number}",
-                    [row_payload],
-                    context="vendor master row update",
-                    value_input_option="USER_ENTERED",
-                )
-        else:
-            _safe_append_row(worksheet, row_payload, context="vendor master row append", value_input_option="USER_ENTERED")
-
-
-def _load_vendor_names_from_master_sheet(spreadsheet) -> list[str]:
-    worksheet = _resolve_worksheet_case_insensitive(spreadsheet, WS_VENDOR_MASTER)
-    if worksheet is None:
-        return []
-
-    values = worksheet.get_all_values()
-    if not values:
-        return []
-
-    header_map = {
-        _normalize_sheet_header(header): idx
-        for idx, header in enumerate(values[0])
-        if str(header).strip()
-    }
-    vendor_idx = header_map.get("vendor", 0)
-
-    vendor_names: list[str] = []
-    seen: set[str] = set()
-    for row in values[1:]:
-        vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
-        if not vendor:
-            continue
-        vendor_key = vendor.casefold()
-        if vendor_key in seen:
-            continue
-        seen.add(vendor_key)
-        vendor_names.append(vendor)
-
-    return vendor_names
-
-
-def _resolve_worksheet_case_insensitive(spreadsheet, worksheet_name: str):
-    target_name = str(worksheet_name or "").strip()
-    if not target_name:
-        return None
-
-    try:
-        return spreadsheet.worksheet(target_name)
-    except Exception:
+        # In some Supabase setups, anon keys with RLS enabled may block this.
         pass
 
-    normalized_target = target_name.casefold()
-    try:
-        for worksheet in spreadsheet.worksheets():
-            if str(worksheet.title).strip().casefold() == normalized_target:
-                return worksheet
-    except Exception:
-        return None
 
+def initialize_data_layer(client: SupabaseClient) -> tuple[bool, str]:
+    ok, message = check_supabase_schema(client)
+    if not ok:
+        return False, message
+
+    seed_users(client)
+    backend_name = getattr(client, "backend_name", "supabase")
+    if backend_name == "local":
+        return True, "Connected to local deployment datastore"
+    return True, "Connected to Supabase"
+
+
+def find_row_by_id(rows: list[dict[str, Any]], record_id: int) -> dict[str, Any] | None:
+    for row in rows:
+        if row.get("id") == record_id:
+            return row
     return None
 
 
-def _get_gspread_spreadsheet_strict():
-    if gspread is None or Credentials is None:
-        raise RuntimeError("gspread/google-auth libraries are not available.")
-
-    target = _gsheet_target()
-    sheet_name = _gsheet_name()
-    if not target:
-        raise RuntimeError("Google Sheet target is not configured.")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    credentials_path = _google_credentials_path()
-    if credentials_path is not None:
-        with open(credentials_path, "r", encoding="utf-8") as credentials_file:
-            service_account_info = json.load(credentials_file)
-        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-    else:
-        service_account_info = _secrets_section("gcp_service_account")
-        if not service_account_info:
-            raise RuntimeError("Service account credentials are not configured.")
-        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
-
-    client = gspread.authorize(creds)
-    spreadsheet = _open_spreadsheet_with_fallback(client, target, sheet_name)
-
-    # No-op write probe confirms write permission without changing data.
-    
-    return spreadsheet
+def parse_iso_date(value: str | None) -> date:
+    if value:
+        return date.fromisoformat(value)
+    return date.today()
 
 
-def save_vendor_to_google_sheets_strict(vendor_catalog_data: dict, vendor: str, contact: str = "", address: str = "") -> None:
-    """Save vendor catalog and vendor master row to Google Sheets without local fallback.
-
-    Any auth/permission/network error is intentionally raised so Streamlit shows the full traceback.
-    """
-    _persist_vendor_local_backup(vendor_catalog_data, source="save_vendor_to_google_sheets_strict")
-    spreadsheet = _get_gspread_spreadsheet_strict()
-
-    try:
-        catalog_ws = spreadsheet.worksheet(WS_VENDOR)
-    except Exception:
-        catalog_ws = spreadsheet.add_worksheet(title=WS_VENDOR, rows="2000", cols=str(max(20, len(VENDOR_COLUMNS) + 4)))
-
-    _upsert_vendor_catalog_sheet(catalog_ws, vendor_catalog_data)
-
-    try:
-        master_ws = spreadsheet.worksheet(WS_VENDOR_MASTER)
-    except Exception:
-        master_ws = spreadsheet.add_worksheet(title=WS_VENDOR_MASTER, rows="2000", cols=str(max(20, len(VENDOR_MASTER_COLUMNS) + 4)))
-        _safe_worksheet_update(master_ws, "A1", [VENDOR_MASTER_COLUMNS], context="vendor master strict create header")
-
-    _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data), contact=contact, address=address)
-    _set_local_override("vendor_catalog", False)
-    _set_session_cached_value("vendor_catalog", vendor_catalog_data)
+def format_pkr(amount: float) -> str:
+    return f"PKR {amount:,.2f}"
 
 
-def ensure_local_data_files() -> None:
-    _ensure_local_backup_dirs()
-
-    if not os.path.exists(VENDOR_FILE):
-        with open(VENDOR_FILE, "w") as file_handle:
-            json.dump({}, file_handle)
-
-    if not os.path.exists(INWARD_FILE):
-        pd.DataFrame(columns=INWARD_COLUMNS).to_csv(INWARD_FILE, index=False)
-
-    if not os.path.exists(PAYMENT_FILE):
-        pd.DataFrame(columns=PAYMENT_COLUMNS).to_csv(PAYMENT_FILE, index=False)
-
-
-def safe_read_csv(file_path: str, expected_columns: list[str]) -> pd.DataFrame:
-    if not os.path.exists(file_path):
-        return pd.DataFrame(columns=expected_columns)
-
-    try:
-        df = pd.read_csv(file_path)
-    except Exception:
-        return pd.DataFrame(columns=expected_columns)
-
-    for col in expected_columns:
-        if col not in df.columns:
-            df[col] = ""
-
-    ordered = [col for col in expected_columns if col in df.columns]
-    extras = [col for col in df.columns if col not in ordered]
-    return df[ordered + extras]
-
-
-def load_vendor_catalog() -> dict:
-    cached_catalog = _get_session_cached_value("vendor_catalog", VENDOR_CACHE_TTL_SECONDS)
-    if isinstance(cached_catalog, dict):
-        return cached_catalog
-
-    if _is_local_override_enabled("vendor_catalog"):
-        if not os.path.exists(VENDOR_FILE):
-            return {}
-        try:
-            with open(VENDOR_FILE, "r") as file_handle:
-                local_data = json.load(file_handle)
-            local_result = local_data if isinstance(local_data, dict) else {}
-            _set_session_cached_value("vendor_catalog", local_result)
-            return local_result
-        except Exception:
-            return {}
-
-    def _catalog_from_df(df: Optional[pd.DataFrame]) -> dict:
-        normalized_df = _normalize_vendor_catalog_df(df)
-        if normalized_df.empty:
-            return {}
-
-        catalog: dict[str, dict] = {}
-        for _, row in normalized_df.iterrows():
-            vendor = str(row.get("Vendor", "")).strip()
-            item = str(row.get("Item", "")).strip()
-            rate = _safe_float(row.get("Rate", 0.0), 0.0)
-
-            if not vendor:
-                continue
-
-            catalog.setdefault(vendor, {})
-            if item:
-                catalog[vendor][item] = rate
-
-        return catalog
-
-    spreadsheet = _get_gspread_spreadsheet()
-    if spreadsheet is None and has_google_service_account():
-        _get_gspread_spreadsheet.clear()
-        spreadsheet = _get_gspread_spreadsheet()
-
-    if spreadsheet is not None:
-        worksheet = _resolve_worksheet_case_insensitive(spreadsheet, WS_VENDOR)
-        catalog: dict[str, dict] = {}
-        if worksheet is not None:
-            try:
-                values = worksheet.get_all_values()
-            except Exception as exc:
-                _record_gsheets_exception(f"vendor catalog read: {WS_VENDOR}", exc)
-                values = []
-
-            if values:
-                header_map = {
-                    _normalize_sheet_header(header): idx
-                    for idx, header in enumerate(values[0])
-                    if str(header).strip()
-                }
-
-                vendor_idx = header_map.get("vendor")
-                item_idx = header_map.get("item")
-                rate_idx = header_map.get("rate")
-
-                if vendor_idx is not None and item_idx is not None and rate_idx is not None:
-                    for row in values[1:]:
-                        vendor = str(row[vendor_idx]).strip() if vendor_idx < len(row) else ""
-                        item = str(row[item_idx]).strip() if item_idx < len(row) else ""
-                        rate_value = row[rate_idx] if rate_idx < len(row) else ""
-
-                        if not vendor:
-                            continue
-
-                        catalog.setdefault(vendor, {})
-                        if item:
-                            catalog[vendor][item] = _safe_float(rate_value, 0.0)
-
-        for vendor_name in _load_vendor_names_from_master_sheet(spreadsheet):
-            catalog.setdefault(vendor_name, {})
-
-        if catalog:
-            _set_session_cached_value("vendor_catalog", catalog)
-            return catalog
-
-    public_df = _public_sheet_to_df(WS_VENDOR, VENDOR_COLUMNS)
-    public_catalog = _catalog_from_df(public_df)
-    if public_catalog:
-        _set_session_cached_value("vendor_catalog", public_catalog)
-        return public_catalog
-
-    if not os.path.exists(VENDOR_FILE):
-        return {}
-
-    try:
-        with open(VENDOR_FILE, "r") as file_handle:
-            data = json.load(file_handle)
-        result = data if isinstance(data, dict) else {}
-        _set_session_cached_value("vendor_catalog", result)
-        return result
-    except Exception:
-        return {}
-
-
-def save_vendor_catalog(vendor_catalog_data: dict) -> tuple[bool, str]:
-    _persist_vendor_local_backup(vendor_catalog_data, source="save_vendor_catalog")
-    _set_session_cached_value("vendor_catalog", vendor_catalog_data)
-
-    write_success = False
-
-    if google_sheets_write_enabled():
-        try:
-            worksheet = _get_or_create_worksheet(WS_VENDOR, VENDOR_COLUMNS)
-            if worksheet is not None:
-                _upsert_vendor_catalog_sheet(worksheet, vendor_catalog_data)
-                master_ws = _get_or_create_worksheet(WS_VENDOR_MASTER, VENDOR_MASTER_COLUMNS)
-                if master_ws is not None:
-                    _upsert_vendor_master_sheet(master_ws, _vendor_names_from_catalog(vendor_catalog_data))
-                write_success = True
-        except Exception as exc:
-            _record_gsheets_exception(f"vendor catalog upsert: {WS_VENDOR}", exc)
-
-        if write_success:
-            _set_local_override("vendor_catalog", False)
-            return True, f"Vendor catalog upserted to Google Sheets tab '{WS_VENDOR}'."
-
-        _set_local_override("vendor_catalog", True)
-        if has_google_service_account():
-            st.warning("Google Sheets sync failed for items catalog. Saved locally as fallback.")
-    else:
-        _set_local_override("vendor_catalog", True)
-
-    details = _last_gsheets_error().strip()
-    if details:
-        return False, f"Saved locally; Google Sheets sync failed.\n{details}"
-    return False, "Saved locally; Google Sheets sync was unavailable or failed."
-
-
-def save_payment_data(df: pd.DataFrame) -> None:
-    _persist_payment_local_backup(df, source="save_payment_data")
-    _set_session_cached_value("payments_data", df)
-
-    write_success = False
-
-    if google_sheets_write_enabled():
-        if _write_sheet_with_retry(WS_PAYMENTS, df, PAYMENT_COLUMNS, retries=1):
-            write_success = True
-            _set_local_override("payments", False)
-            return
-        if has_google_service_account():
-            st.warning("Google Sheets sync failed for payments. Saved locally as fallback.")
-
-    if not write_success:
-        _set_local_override("payments", True)
-
-
-def parse_optional_rate(rate_value: str) -> float:
-    text = str(rate_value).strip()
+def parse_row_date(value: Any) -> date:
+    text = str(value or "").strip()
     if not text:
-        return 0.0
+        return date.today()
     try:
-        return float(text)
-    except ValueError:
-        return 0.0
+        return date.fromisoformat(text[:10])
+    except Exception:
+        return date.today()
 
 
-def to_strict_title_case(text: str) -> str:
-    cleaned_text = " ".join(str(text).strip().split())
-    if not cleaned_text:
-        return ""
-    return " ".join(token[:1].upper() + token[1:].lower() for token in cleaned_text.split(" "))
+def generate_vendor_statement_pdf(
+    vendor_name: str,
+    start_date: date,
+    end_date: date,
+    ledger_rows: list[dict[str, Any]],
+    opening_balance: float,
+    closing_balance: float,
+) -> io.BytesIO:
+    # Lazy import keeps the app running even when reportlab is not installed.
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-
-def build_print_view_data_uri(print_html: str) -> str:
-    if not print_html:
-        return ""
-    return f"data:text/html;charset=utf-8,{quote(print_html)}"
-
-
-def generate_store_slip_code() -> str:
-    return uuid.uuid4().hex[:12].upper()
-
-
-def create_store_slip_pdf(vendor_name: str, item_name: str, quantity: int) -> tuple[bytes, str, str]:
-    if not REPORTLAB_AVAILABLE:
-        raise RuntimeError("reportlab is not installed.")
-
-    slip_code = generate_store_slip_code()
-    created_time = datetime.now().strftime("%Y-%m-%d %H:%M")
     buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A5,
-        leftMargin=0.4 * inch,
-        rightMargin=0.4 * inch,
-        topMargin=0.4 * inch,
-        bottomMargin=0.4 * inch,
-    )
-
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    elements: list[Any] = []
     styles = getSampleStyleSheet()
+
     title_style = ParagraphStyle(
-        "SlipTitle",
+        "DocTitle",
         parent=styles["Heading1"],
         fontName="Helvetica-Bold",
-        fontSize=18,
-        leading=22,
-        textColor=colors.HexColor("#111827"),
+        fontSize=20,
+        leading=24,
+        textColor=colors.HexColor("#1E3A8A"),
+        spaceAfter=4,
     )
     subtitle_style = ParagraphStyle(
-        "SlipSubtitle",
+        "DocSubTitle",
         parent=styles["Normal"],
         fontName="Helvetica",
-        fontSize=11,
-        leading=15,
+        fontSize=10,
+        leading=14,
         textColor=colors.HexColor("#4B5563"),
+        spaceAfter=15,
     )
-    label_style = ParagraphStyle(
-        "SlipLabel",
+    cell_style = ParagraphStyle(
+        "CellText",
         parent=styles["Normal"],
-        fontName="Helvetica-Bold",
-        fontSize=11,
-        leading=16,
+        fontName="Helvetica",
+        fontSize=9,
+        leading=12,
         textColor=colors.HexColor("#1F2937"),
     )
-    value_style = ParagraphStyle(
-        "SlipValue",
+
+    elements.append(Paragraph("PREXA INDUSTRIES", title_style))
+    elements.append(Paragraph("Surgical Instruments Manufacturing & Export<br/><b>Vendor Statement of Account</b>", subtitle_style))
+
+    meta_data = [
+        [
+            Paragraph(f"<b>Vendor Name:</b> {vendor_name}", cell_style),
+            Paragraph(f"<b>Period:</b> {start_date.isoformat()} to {end_date.isoformat()}", cell_style),
+        ],
+        [
+            Paragraph(f"<b>Opening Balance:</b> {format_pkr(opening_balance)}", cell_style),
+            Paragraph(f"<b>Closing Balance:</b> {format_pkr(closing_balance)}", cell_style),
+        ],
+    ]
+    meta_table = Table(meta_data, colWidths=[250, 250])
+    meta_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F4F6")),
+                ("PADDING", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    elements.append(meta_table)
+    elements.append(Spacer(1, 15))
+
+    table_data = [["Date", "Type", "Reference / Lot", "Description / Item", "Qty", "Amount (PKR)", "Balance (PKR)"]]
+    for row in ledger_rows:
+        table_data.append(
+            [
+                str(row.get("date") or ""),
+                str(row.get("entry_type") or ""),
+                str(row.get("reference_number") or ""),
+                str(row.get("item_name") or ""),
+                f"{float(row.get('quantity') or 0.0):,.2f}",
+                f"{float(row.get('amount') or 0.0):,.2f}",
+                f"{float(row.get('running_balance') or 0.0):,.2f}",
+            ]
+        )
+
+    # Total width is tuned for letter page with left/right margins (about 552 pts).
+    col_widths = [55, 80, 95, 150, 32, 70, 70]
+    ledger_table = Table(table_data, colWidths=col_widths)
+    ledger_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E3A8A")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, 0), 5),
+                ("TOPPADDING", (0, 0), (-1, 0), 5),
+                ("ALIGN", (4, 0), (-1, -1), "RIGHT"),
+                ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#FFFFFF")),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#FFFFFF"), colors.HexColor("#F9FAFB")]),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
+                ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+                ("PADDING", (0, 1), (-1, -1), 4),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    elements.append(ledger_table)
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+
+def generate_inward_slip_pdf(inward_data: dict[str, Any]) -> io.BytesIO:
+    """Create an official inward receipt slip for the latest saved inward lot."""
+    # Lazy import keeps the app running even when reportlab is not installed.
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.platypus import Image as RLImage
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    def generate_qr_code(data: str) -> io.BytesIO:
+        import qrcode
+
+        qr_img = qrcode.make(data)
+        qr_buffer = io.BytesIO()
+        qr_img.save(qr_buffer, format="PNG")
+        qr_buffer.seek(0)
+        return qr_buffer
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    elements: list[Any] = []
+    styles = getSampleStyleSheet()
+
+    body_style = ParagraphStyle(
+        "SlipBody",
         parent=styles["Normal"],
         fontName="Helvetica",
-        fontSize=11,
-        leading=16,
-        textColor=colors.HexColor("#111827"),
+        fontSize=10,
+        textColor=colors.HexColor("#1F2937"),
+        spaceAfter=6,
     )
 
-    elements = [
-        Paragraph("PREXA INDUSTRIES", title_style),
-        Paragraph("Factory Store Slip (A5 PDF)", subtitle_style),
-        Spacer(1, 10),
-        HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#111827"), spaceAfter=15),
-    ]
+    qr_data = (
+        f"Lot: {inward_data.get('lot_number', '')} | "
+        f"Vendor: {inward_data.get('vendor_name', '')} | "
+        f"Item: {inward_data.get('item', '')} | "
+        f"Qty: {inward_data.get('quantity', 0)}"
+    )
+    qr_buffer = generate_qr_code(qr_data)
+    qr_image = RLImage(qr_buffer, width=55, height=55)
 
-    table_data = [
-        [Paragraph("Vendor:", label_style), Paragraph(vendor_name, value_style)],
-        [Paragraph("Item:", label_style), Paragraph(item_name, value_style)],
-        [Paragraph("Quantity:", label_style), Paragraph(str(quantity), value_style)],
-        [Paragraph("Slip Code:", label_style), Paragraph(slip_code, value_style)],
-        [Paragraph("Created Time:", label_style), Paragraph(created_time, value_style)],
-    ]
-    details_table = Table(table_data, colWidths=[1.8 * inch, 3.2 * inch])
-    details_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
-    elements.append(details_table)
-    elements.append(Spacer(1, 20))
-
-    elements.append(code128.Code128(slip_code, barWidth=1.5, barHeight=45))
-    elements.append(Spacer(1, 25))
-
-    signature_table = Table(
+    header_data = [
         [
-            [Paragraph("____________________", value_style), Paragraph("____________________", value_style)],
-            [Paragraph("Store Manager", label_style), Paragraph("Receiver", label_style)],
-        ],
-        colWidths=[2.5 * inch, 2.5 * inch],
+            Paragraph(
+                "<b>PREXA INDUSTRIES</b><br/>"
+                "<font size='8' color='#4B5563'>"
+                "Surgical Instruments Manufacturing & Export - Sialkot<br/>"
+                "<b>INWARD RECEIPT / GATE PASS</b>"
+                "</font>",
+                body_style,
+            ),
+            qr_image,
+        ]
+    ]
+    header_table = Table(header_data, colWidths=[440, 100])
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                ("RIGHTPADDING", (1, 0), (1, 0), 0),
+            ]
+        )
     )
-    signature_table.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "TOP")]))
-    elements.append(signature_table)
+    elements.append(header_table)
+    elements.append(Spacer(1, 10))
+
+    info_data = [
+        [
+            Paragraph(f"<b>Lot Number:</b> {inward_data.get('lot_number', '')}", body_style),
+            Paragraph(f"<b>Date:</b> {inward_data.get('date', '')}", body_style),
+        ],
+        [
+            Paragraph(f"<b>Vendor / Worker Name:</b> {inward_data.get('vendor_name', '')}", body_style),
+            Paragraph("<b>Status:</b> Received & Verified", body_style),
+        ],
+    ]
+    info_table = Table(info_data, colWidths=[270, 270])
+    info_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#F3F4F6")),
+                ("PADDING", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+            ]
+        )
+    )
+    elements.append(info_table)
+    elements.append(Spacer(1, 15))
+
+    elements.append(Paragraph("<b>Received Items Details:</b>", body_style))
+    items_data = [["Item Description", "Quantity", "Rate (PKR)", "Total Amount (PKR)"]]
+    items_data.append(
+        [
+            str(inward_data.get("item", "")),
+            f"{float(inward_data.get('quantity', 0.0)):,.2f}",
+            f"{float(inward_data.get('rate', 0.0)):,.2f}",
+            f"{float(inward_data.get('calculated_amount', 0.0)):,.2f}",
+        ]
+    )
+    item_table = Table(items_data, colWidths=[220, 80, 110, 130])
+    item_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1E3A8A")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTSIZE", (0, 0), (-1, 0), 9),
+                ("PADDING", (0, 0), (-1, -1), 6),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#D1D5DB")),
+                ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                ("ALIGN", (0, 0), (0, -1), "LEFT"),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ]
+        )
+    )
+    elements.append(item_table)
+    elements.append(Spacer(1, 30))
+
+    sign_data = [[
+        Paragraph("<b>Prepared By:</b> ___________________", body_style),
+        Paragraph("<b>Receiver's Signature:</b> ___________________", body_style),
+    ]]
+    sign_table = Table(sign_data, colWidths=[270, 270])
+    elements.append(sign_table)
 
     doc.build(elements)
     buffer.seek(0)
-    return buffer.read(), slip_code, created_time
+    return buffer
 
 
-def render_store_manager_portal(vendor_catalog_data: dict) -> None:
-    st.markdown("<div class='store-slip-shell'>", unsafe_allow_html=True)
-    st.subheader("Store slip portal")
-    st.caption("Store manager access is limited to store slip generation only.")
+def render_delete_confirmation(state_key: str, record_id: int, label: str) -> bool:
+    if st.button("Delete Selected Record", key=f"{state_key}_request"):
+        st.session_state[state_key] = record_id
+        st.rerun()
 
-    if not REPORTLAB_AVAILABLE:
-        st.error("ReportLab is required for PDF store slips. Add `reportlab` to the environment and restart the app.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+    if st.session_state.get(state_key) == record_id:
+        st.warning(f"Confirm deletion for {label}. This action cannot be undone.")
+        confirm_col, cancel_col = st.columns(2)
+        if confirm_col.button("Confirm Delete", key=f"{state_key}_confirm"):
+            st.session_state.pop(state_key, None)
+            return True
+        if cancel_col.button("Cancel", key=f"{state_key}_cancel"):
+            st.session_state.pop(state_key, None)
+            st.rerun()
 
-    if not vendor_catalog_data:
-        st.warning("No vendors are available in the catalog. Ask an admin to configure vendors and items first.")
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
+    return False
 
-    vendor_options = sorted(vendor_catalog_data.keys())
-    with st.container(border=True):
-        st.markdown("### Generate store slip PDF")
-        with st.form("store_manager_slip_form", clear_on_submit=False):
-            selected_vendor = st.selectbox("Vendor", options=vendor_options, key="store_manager_vendor_select")
-            vendor_items = sorted(vendor_catalog_data.get(selected_vendor, {}).keys())
-            selected_item = st.selectbox(
-                "Item",
-                options=vendor_items if vendor_items else ["No items available"],
-                key="store_manager_item_select",
-            )
-            quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="store_manager_quantity_input")
-            generate_pdf = st.form_submit_button("Generate store slip PDF")
 
-        if generate_pdf:
-            if not vendor_items or selected_item == "No items available":
-                st.error("The selected vendor has no configured items.")
-            else:
-                normalized_item = to_strict_title_case(selected_item)
-                pdf_bytes, slip_code, created_time = create_store_slip_pdf(selected_vendor, normalized_item, int(quantity))
-                os.makedirs("slips", exist_ok=True)
-                pdf_path = os.path.join("slips", f"slip_{slip_code}.pdf")
-                with open(pdf_path, "wb") as pdf_file:
-                    pdf_file.write(pdf_bytes)
+def normalize_code_number(value: str, prefix: str) -> int:
+    match = re.match(rf"^{prefix}-(\d+)$", value or "")
+    if not match:
+        return 0
+    return int(match.group(1))
 
-                append_slip_record(selected_vendor, normalized_item, int(quantity), slip_code, pdf_path, created_time)
-                st.session_state.store_manager_last_slip = {
-                    "pdf_bytes": pdf_bytes,
-                    "slip_code": slip_code,
-                    "created_time": created_time,
-                    "vendor": selected_vendor,
-                    "item": normalized_item,
-                    "quantity": int(quantity),
+
+def next_numbered_code(existing_values: list[str], prefix: str) -> str:
+    max_number = 0
+    for value in existing_values:
+        max_number = max(max_number, normalize_code_number(value, prefix))
+    return f"{prefix}-{max_number + 1:03d}"
+
+
+def is_unique_violation(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "duplicate key" in message or "unique" in message
+
+
+def fetch_users(client: SupabaseClient) -> list[dict[str, Any]]:
+    response = client.table("users").select("id, username, full_name, role, created_at").order("username").execute()
+    return response.data or []
+
+
+def authenticate(client: SupabaseClient, username: str, password: str) -> dict[str, Any] | None:
+    response = (
+        client.table("users")
+        .select("id, username, full_name, role")
+        .eq("username", username.strip())
+        .eq("password_hash", hash_password(password))
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return rows[0] if rows else None
+
+
+def create_user(client: SupabaseClient, username: str, full_name: str, role: str, password: str) -> None:
+    client.table("users").insert(
+        {
+            "username": username.strip(),
+            "full_name": full_name.strip(),
+            "role": role,
+            "password_hash": hash_password(password),
+        }
+    ).execute()
+
+
+def fetch_vendors(client: SupabaseClient) -> list[dict[str, Any]]:
+    response = (
+        client.table("vendors")
+        .select("id, vendor_code, vendor_name, contact_person, email, phone, created_at")
+        .order("vendor_name")
+        .execute()
+    )
+    return response.data or []
+
+
+def generate_vendor_code(client: SupabaseClient) -> str:
+    vendor_rows = client.table("vendors").select("vendor_code").execute().data or []
+    existing_codes = [row.get("vendor_code", "") for row in vendor_rows]
+    return next_numbered_code(existing_codes, "VEND")
+
+
+def create_vendor(client: SupabaseClient, vendor_name: str, contact_person: str, email: str, phone: str) -> str:
+    vendor_code = generate_vendor_code(client)
+    client.table("vendors").insert(
+        {
+            "vendor_code": vendor_code,
+            "vendor_name": vendor_name.strip(),
+            "contact_person": contact_person.strip(),
+            "email": email.strip(),
+            "phone": phone.strip(),
+        }
+    ).execute()
+    return vendor_code
+
+
+def update_vendor(client: SupabaseClient, vendor_id: int, payload: dict[str, Any]) -> None:
+    client.table("vendors").update(payload).eq("id", vendor_id).execute()
+
+
+def delete_vendor(client: SupabaseClient, vendor_id: int) -> None:
+    client.table("vendors").delete().eq("id", vendor_id).execute()
+
+
+def fetch_items(client: SupabaseClient) -> list[dict[str, Any]]:
+    items = (
+        client.table("items")
+        .select("id, sku, item_name, unit, unit_price, stock_on_hand, vendor_id, created_at")
+        .order("item_name")
+        .execute()
+        .data
+        or []
+    )
+
+    vendors = fetch_vendors(client)
+    vendor_names = {vendor["id"]: vendor["vendor_name"] for vendor in vendors}
+    for item in items:
+        item["vendor_name"] = vendor_names.get(item.get("vendor_id"), "Unassigned")
+    return items
+
+
+def generate_sku(client: SupabaseClient) -> str:
+    item_rows = client.table("items").select("sku").order("id", desc=True).limit(200).execute().data or []
+    existing_skus = [row.get("sku", "") for row in item_rows]
+    return next_numbered_code(existing_skus, "SKU")
+
+
+def create_item(
+    client: SupabaseClient,
+    item_name: str,
+    unit: str,
+    unit_price: float,
+    stock_on_hand: float,
+    vendor_id: int | None,
+) -> str:
+    # Retry a few times in case two users generate the same next SKU concurrently.
+    for _ in range(5):
+        sku = generate_sku(client)
+        try:
+            inserted_rows = client.table("items").insert(
+                {
+                    "sku": sku,
+                    "item_name": item_name.strip(),
+                    "unit": unit,
+                    "unit_price": float(unit_price),
+                    "stock_on_hand": float(stock_on_hand),
+                    "vendor_id": vendor_id,
                 }
-                st.success(f"Store slip {slip_code} generated successfully.")
+            ).execute().data or []
+            if vendor_id is not None and inserted_rows:
+                upsert_vendor_item_rate(client, int(vendor_id), int(inserted_rows[0]["id"]), float(unit_price))
+            return sku
+        except Exception as exc:
+            if not is_unique_violation(exc):
+                raise
 
-    last_slip = st.session_state.get("store_manager_last_slip")
-    if isinstance(last_slip, dict) and last_slip.get("pdf_bytes"):
-        with st.container(border=True):
-            st.markdown("### Latest generated slip")
-            st.text_input("Slip code", value=str(last_slip.get("slip_code", "")), disabled=True, key="store_manager_last_slip_code")
-            st.text_input("Created time", value=str(last_slip.get("created_time", "")), disabled=True, key="store_manager_last_created_time")
-            st.text_input("Vendor", value=str(last_slip.get("vendor", "")), disabled=True, key="store_manager_last_vendor")
-            st.text_input("Item", value=str(last_slip.get("item", "")), disabled=True, key="store_manager_last_item")
-            st.text_input("Quantity", value=str(last_slip.get("quantity", "")), disabled=True, key="store_manager_last_quantity")
-            st.download_button(
-                "Download / print store slip PDF",
-                data=last_slip["pdf_bytes"],
-                file_name=f"slip_{last_slip['slip_code']}.pdf",
-                mime="application/pdf",
-                key="store_manager_download_slip_pdf",
-            )
-
-    recent_slips = get_recent_slips_store(8)
-    with st.container(border=True):
-        st.subheader("Recent slips")
-        if recent_slips:
-            render_controlled_table(
-                pd.DataFrame([
-                    {
-                        "Slip Code": row[0],
-                        "Vendor": row[1],
-                        "Item": row[2],
-                        "Qty": row[3],
-                        "Created": row[4],
-                    }
-                    for row in recent_slips
-                ]),
-                show_index=False,
-            )
-        else:
-            st.info("No slips generated yet.")
-
-    st.markdown("</div>", unsafe_allow_html=True)
+    raise RuntimeError("Could not generate a unique SKU after multiple attempts.")
 
 
-def render_controlled_table(df: pd.DataFrame, *, show_index: bool = False, max_height: Optional[int] = None) -> None:
-    if df is None:
-        st.info("No records available.")
-        return
+def update_item(client: SupabaseClient, item_id: int, payload: dict[str, Any]) -> None:
+    existing_rows = client.table("items").select("vendor_id").eq("id", item_id).limit(1).execute().data or []
+    previous_vendor_id = existing_rows[0].get("vendor_id") if existing_rows else None
+    client.table("items").update(payload).eq("id", item_id).execute()
+    vendor_id = payload.get("vendor_id")
+    unit_price = payload.get("unit_price")
+    if previous_vendor_id is not None and previous_vendor_id != vendor_id:
+        delete_vendor_item_rate_by_vendor_item(client, int(previous_vendor_id), int(item_id))
+    if vendor_id is None:
+        delete_vendor_item_rates_for_item(client, int(item_id))
+    elif unit_price is not None:
+        delete_vendor_item_rates_for_item(client, int(item_id))
+        upsert_vendor_item_rate(client, int(vendor_id), int(item_id), float(unit_price))
 
-    table_df = df.copy().where(pd.notna(df), "")
-    table_html = table_df.to_html(index=show_index, classes="prexa-table", border=0, escape=True)
-    max_height_style = f"max-height:{int(max_height)}px;overflow:auto;" if max_height else ""
+
+def delete_item(client: SupabaseClient, item_id: int) -> None:
+    delete_vendor_item_rates_for_item(client, int(item_id))
+    client.table("items").delete().eq("id", item_id).execute()
+
+
+def fetch_vendor_item_rates(client: SupabaseClient) -> list[dict[str, Any]]:
+    mappings = (
+        client.table("vendor_item_rates")
+        .select("id, vendor_id, item_id, unit_rate, created_at")
+        .order("id", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+    vendors = fetch_vendors(client)
+    items = fetch_items(client)
+    vendor_names = {vendor["id"]: vendor["vendor_name"] for vendor in vendors}
+    item_labels = {item["id"]: f"{item['item_name']} ({item['sku']})" for item in items}
+
+    for mapping in mappings:
+        mapping["vendor_name"] = vendor_names.get(mapping.get("vendor_id"), "Unknown")
+        mapping["item_label"] = item_labels.get(mapping.get("item_id"), "Unknown")
+
+    return mappings
+
+
+def sync_vendor_item_rates_from_items(client: SupabaseClient, vendor_name: str | None = None) -> None:
+    items = fetch_items(client)
+    vendors = fetch_vendors(client)
+    vendor_names = {vendor["id"]: vendor["vendor_name"] for vendor in vendors}
+
+    for item in items:
+        vendor_id = item.get("vendor_id")
+        if vendor_id is None:
+            continue
+        mapped_vendor_name = vendor_names.get(vendor_id, "")
+        if vendor_name and mapped_vendor_name.casefold() != vendor_name.strip().casefold():
+            continue
+        upsert_vendor_item_rate(client, int(vendor_id), int(item["id"]), float(item.get("unit_price") or 0.0))
+
+
+def fetch_vendor_item_rates_for_vendor(client: SupabaseClient, vendor_id: int) -> list[dict[str, Any]]:
+    mappings = (
+        client.table("vendor_item_rates")
+        .select("id, vendor_id, item_id, unit_rate, created_at")
+        .eq("vendor_id", vendor_id)
+        .order("id", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+    item_ids = sorted({int(mapping["item_id"]) for mapping in mappings if mapping.get("item_id") is not None})
+    item_labels: dict[int, str] = {}
+    for item_id in item_ids:
+        item_rows = (
+            client.table("items")
+            .select("id, sku, item_name")
+            .eq("id", item_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if item_rows:
+            item_row = item_rows[0]
+            item_labels[int(item_row["id"])] = f"{item_row['item_name']} ({item_row['sku']})"
+
+    unique_mappings: list[dict[str, Any]] = []
+    seen_item_ids: set[int] = set()
+    for mapping in mappings:
+        item_id = int(mapping.get("item_id") or 0)
+        if item_id in seen_item_ids:
+            continue
+        seen_item_ids.add(item_id)
+        mapping["item_label"] = item_labels.get(item_id, "Unknown")
+        unique_mappings.append(mapping)
+
+    return unique_mappings
+
+
+def fetch_vendor_item_rates_for_vendor_name(client: SupabaseClient, vendor_name: str) -> list[dict[str, Any]]:
+    normalized_vendor_name = vendor_name.strip()
+    sync_vendor_item_rates_from_items(client, normalized_vendor_name)
+
+    if getattr(client, "backend_name", "") == "local" and isinstance(client, LocalClient):
+        sql = """
+            SELECT vir.id, vir.vendor_id, vir.item_id, vir.unit_rate, vir.created_at,
+                   v.vendor_name, i.item_name, i.sku
+            FROM vendor_item_rates vir
+            INNER JOIN vendors v ON v.id = vir.vendor_id
+            INNER JOIN items i ON i.id = vir.item_id
+            WHERE TRIM(LOWER(v.vendor_name)) = TRIM(LOWER(?))
+            ORDER BY i.item_name ASC, vir.id DESC
+        """
+        print("INWARD_VENDOR_QUERY_SQL:", " ".join(sql.split()))
+        print("INWARD_VENDOR_QUERY_PARAMS:", [normalized_vendor_name])
+        with client.get_connection() as conn:
+            rows = [dict(row) for row in conn.execute(sql, (normalized_vendor_name,)).fetchall()]
+        print("INWARD_VENDOR_QUERY_ROWS:", rows)
+
+        unique_rows: list[dict[str, Any]] = []
+        seen_item_ids: set[int] = set()
+        for row in rows:
+            item_id = int(row.get("item_id") or 0)
+            if item_id in seen_item_ids:
+                continue
+            seen_item_ids.add(item_id)
+            row["item_label"] = f"{row['item_name']} ({row['sku']})"
+            unique_rows.append(row)
+        return unique_rows
+
+    vendor_rows = (
+        client.table("vendors")
+        .select("id, vendor_name")
+        .eq("vendor_name", normalized_vendor_name)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    print("INWARD_VENDOR_QUERY_FALLBACK_VENDOR:", vendor_rows)
+    if not vendor_rows:
+        print("INWARD_VENDOR_QUERY_FALLBACK_ROWS:", [])
+        return []
+    rows = fetch_vendor_item_rates_for_vendor(client, int(vendor_rows[0]["id"]))
+    print("INWARD_VENDOR_QUERY_FALLBACK_ROWS:", rows)
+    return rows
+
+
+def upsert_vendor_item_rate(client: SupabaseClient, vendor_id: int, item_id: int, unit_rate: float) -> None:
+    existing = (
+        client.table("vendor_item_rates")
+        .select("id")
+        .eq("vendor_id", vendor_id)
+        .eq("item_id", item_id)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    if existing:
+        client.table("vendor_item_rates").update({"unit_rate": float(unit_rate)}).eq("id", existing[0]["id"]).execute()
+    else:
+        client.table("vendor_item_rates").insert(
+            {
+                "vendor_id": vendor_id,
+                "item_id": item_id,
+                "unit_rate": float(unit_rate),
+            }
+        ).execute()
+
+
+def delete_vendor_item_rate(client: SupabaseClient, mapping_id: int) -> None:
+    client.table("vendor_item_rates").delete().eq("id", mapping_id).execute()
+
+
+def delete_vendor_item_rate_by_vendor_item(client: SupabaseClient, vendor_id: int, item_id: int) -> None:
+    client.table("vendor_item_rates").delete().eq("vendor_id", vendor_id).eq("item_id", item_id).execute()
+
+
+def delete_vendor_item_rates_for_item(client: SupabaseClient, item_id: int) -> None:
+    client.table("vendor_item_rates").delete().eq("item_id", item_id).execute()
+
+
+def fetch_receipts(client: SupabaseClient) -> list[dict[str, Any]]:
+    receipts = (
+        client.table("receipts")
+        .select(
+            "id, receipt_number, receipt_date, vendor_id, item_id, quantity, unit_cost, received_by, notes, created_at"
+        )
+        .order("receipt_date", desc=True)
+        .order("id", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+    vendors = fetch_vendors(client)
+    items = fetch_items(client)
+    vendor_names = {vendor["id"]: vendor["vendor_name"] for vendor in vendors}
+    item_names = {item["id"]: item["item_name"] for item in items}
+
+    for receipt in receipts:
+        receipt["vendor_name"] = vendor_names.get(receipt.get("vendor_id"), "Unknown")
+        receipt["item_name"] = item_names.get(receipt.get("item_id"), "Unknown")
+
+    return receipts
+
+
+def create_receipt(
+    client: SupabaseClient,
+    receipt_number: str,
+    receipt_date: date,
+    vendor_id: int,
+    item_id: int,
+    quantity: float,
+    unit_cost: float,
+    received_by: str,
+    notes: str,
+) -> None:
+    client.table("receipts").insert(
+        {
+            "receipt_number": receipt_number.strip().upper(),
+            "receipt_date": receipt_date.isoformat(),
+            "vendor_id": vendor_id,
+            "item_id": item_id,
+            "quantity": float(quantity),
+            "unit_cost": float(unit_cost),
+            "received_by": received_by,
+            "notes": notes.strip(),
+        }
+    ).execute()
+
+    item_row = client.table("items").select("stock_on_hand").eq("id", item_id).limit(1).execute().data
+    current_stock = float(item_row[0]["stock_on_hand"]) if item_row else 0.0
+    client.table("items").update(
+        {
+            "stock_on_hand": current_stock + float(quantity),
+        }
+    ).eq("id", item_id).execute()
+
+
+def fetch_inward_lots(client: SupabaseClient) -> list[dict[str, Any]]:
+    lots = (
+        client.table("inward_lots")
+        .select(
+            "id, lot_number, receipt_id, vendor_id, item_id, quantity_received, manufacturing_date, expiry_date, qc_status, warehouse_bin, notes, created_by, created_at"
+        )
+        .order("created_at", desc=True)
+        .order("id", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+    vendors = fetch_vendors(client)
+    items = fetch_items(client)
+    receipts = fetch_receipts(client)
+    vendor_names = {vendor["id"]: vendor["vendor_name"] for vendor in vendors}
+    item_names = {item["id"]: item["item_name"] for item in items}
+    receipt_numbers = {receipt["id"]: receipt["receipt_number"] for receipt in receipts}
+
+    for lot in lots:
+        lot["vendor_name"] = vendor_names.get(lot.get("vendor_id"), "Unknown")
+        lot["item_name"] = item_names.get(lot.get("item_id"), "Unknown")
+        lot["receipt_number"] = receipt_numbers.get(lot.get("receipt_id"), "Unknown")
+
+    return lots
+
+
+def create_inward_lot(client: SupabaseClient, payload: dict[str, Any]) -> None:
+    client.table("inward_lots").insert(payload).execute()
+
+
+def update_inward_lot(client: SupabaseClient, lot_id: int, payload: dict[str, Any]) -> None:
+    client.table("inward_lots").update(payload).eq("id", lot_id).execute()
+
+
+def delete_inward_lot(client: SupabaseClient, lot_id: int) -> None:
+    client.table("inward_lots").delete().eq("id", lot_id).execute()
+
+
+def fetch_payment_slips(client: SupabaseClient) -> list[dict[str, Any]]:
+    vouchers = (
+        client.table(PAYMENT_SLIPS_TABLE)
+        .select(
+            "id, voucher_number, voucher_date, vendor_id, amount, tracking_number, tracking_status, "
+            "packing_reference, operation_notes, vendor_signature_name, vendor_signature_date, approved_by, remarks, created_at"
+        )
+        .order("voucher_date", desc=True)
+        .order("id", desc=True)
+        .execute()
+        .data
+        or []
+    )
+
+    vendors = fetch_vendors(client)
+    vendor_names = {vendor["id"]: vendor["vendor_name"] for vendor in vendors}
+    for voucher in vouchers:
+        vendor_name = vendor_names.get(voucher.get("vendor_id"))
+        remarks = str(voucher.get("remarks") or "")
+        payee_name = remarks
+        if remarks.startswith("PAYEE:"):
+            payee_name = remarks.split("PAYEE:", 1)[1].strip()
+        voucher["vendor_name"] = vendor_name or "Unlinked"
+        voucher["payee_name"] = vendor_name or payee_name or "Unknown"
+        voucher["payee_type"] = "Vendor" if voucher.get("vendor_id") else "Worker"
+        voucher["description"] = voucher.get("operation_notes") or ""
+    return vouchers
+
+
+def generate_payment_slip_number(client: SupabaseClient) -> str:
+    rows = client.table(PAYMENT_SLIPS_TABLE).select("voucher_number").order("id", desc=True).limit(200).execute().data or []
+    existing = [row.get("voucher_number", "") for row in rows]
+    # New records use PSV prefix; existing PPV records remain untouched.
+    return next_numbered_code(existing, "PSV")
+
+
+def create_payment_slip(client: SupabaseClient, payload: dict[str, Any]) -> None:
+    client.table(PAYMENT_SLIPS_TABLE).insert(payload).execute()
+
+
+def update_payment_slip(client: SupabaseClient, voucher_id: int, payload: dict[str, Any]) -> None:
+    client.table(PAYMENT_SLIPS_TABLE).update(payload).eq("id", voucher_id).execute()
+
+
+def delete_payment_slip(client: SupabaseClient, voucher_id: int) -> None:
+    client.table(PAYMENT_SLIPS_TABLE).delete().eq("id", voucher_id).execute()
+
+
+def fetch_vendor_ledger_rows(client: SupabaseClient) -> list[dict[str, Any]]:
+    lots = fetch_inward_lots(client)
+    receipts = fetch_receipts(client)
+    payment_slips = fetch_payment_slips(client)
+    receipt_by_id = {int(receipt["id"]): receipt for receipt in receipts}
+
+    ledger_rows: list[dict[str, Any]] = []
+    for lot in lots:
+        receipt = receipt_by_id.get(int(lot.get("receipt_id") or 0))
+        if not receipt:
+            continue
+        quantity = float(lot.get("quantity_received") or 0.0)
+        unit_rate = float(receipt.get("unit_cost") or 0.0)
+        amount = quantity * unit_rate
+        ledger_rows.append(
+            {
+                "entry_id": f"lot-{lot.get('id')}",
+                "date": receipt.get("receipt_date") or lot.get("created_at") or "",
+                "vendor_id": lot.get("vendor_id"),
+                "vendor_name": lot.get("vendor_name"),
+                "entry_type": "Inward Lot",
+                "item_name": lot.get("item_name"),
+                "reference_number": lot.get("lot_number"),
+                "quantity": quantity,
+                "unit_rate": unit_rate,
+                "amount": amount,
+                "sort_id": int(lot.get("id") or 0),
+            }
+        )
+
+    for slip in payment_slips:
+        vendor_id = slip.get("vendor_id")
+        payee_name = str(slip.get("payee_name") or "").strip()
+        vendor_name = str(slip.get("vendor_name") or payee_name or "Unknown")
+        amount = -abs(float(slip.get("amount") or 0.0))
+        ledger_rows.append(
+            {
+                "entry_id": f"slip-{slip.get('id')}",
+                "date": slip.get("voucher_date") or slip.get("created_at") or "",
+                "vendor_id": vendor_id,
+                "vendor_name": vendor_name,
+                "entry_type": "Payment",
+                "item_name": slip.get("description") or "Payment Slip",
+                "reference_number": slip.get("voucher_number"),
+                "quantity": 0.0,
+                "unit_rate": 0.0,
+                "amount": amount,
+                "sort_id": int(slip.get("id") or 0),
+                "payee_name": payee_name,
+            }
+        )
+
+    # Combine inward and payment rows, then sort oldest to newest so running balance
+    # follows the true ledger sequence.
+    ledger_rows.sort(key=lambda row: (row.get("date") or "", row.get("sort_id") or 0))
+
+    running_balance_by_vendor: dict[str, float] = {}
+    enriched_rows: list[dict[str, Any]] = []
+    for row in ledger_rows:
+        vendor_balance_key = str(row.get("vendor_id") if row.get("vendor_id") is not None else row.get("vendor_name") or "")
+        running_balance_by_vendor.setdefault(vendor_balance_key, 0.0)
+        running_balance_by_vendor[vendor_balance_key] += float(row.get("amount") or 0.0)
+        enriched = dict(row)
+        enriched["running_balance"] = running_balance_by_vendor[vendor_balance_key]
+        enriched_rows.append(enriched)
+
+    return enriched_rows
+
+
+def fetch_inward_summary_rows(client: SupabaseClient) -> list[dict[str, Any]]:
+    receipts = fetch_receipts(client)
+    summary_by_vendor_item: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for receipt in receipts:
+        vendor_name = str(receipt.get("vendor_name") or "Unknown")
+        item_name = str(receipt.get("item_name") or "Unknown")
+        key = (vendor_name, item_name)
+        quantity = float(receipt.get("quantity") or 0.0)
+        unit_rate = float(receipt.get("unit_cost") or 0.0)
+        amount = quantity * unit_rate
+        if key not in summary_by_vendor_item:
+            summary_by_vendor_item[key] = {
+                "vendor_name": vendor_name,
+                "item_name": item_name,
+                "inward_entries": 0,
+                "total_quantity": 0.0,
+                "total_amount": 0.0,
+            }
+        summary_by_vendor_item[key]["inward_entries"] += 1
+        summary_by_vendor_item[key]["total_quantity"] += quantity
+        summary_by_vendor_item[key]["total_amount"] += amount
+
+    rows = list(summary_by_vendor_item.values())
+    rows.sort(key=lambda row: (row["vendor_name"], row["item_name"]))
+    return rows
+
+
+
+
+def inject_styles() -> None:
     st.markdown(
-        f"<div class='prexa-table-wrap' style='{max_height_style}'>{table_html}</div>",
+        """
+        <style>
+        :root {
+            --bg-start: #f2f5fa;
+            --bg-end: #e5ebf3;
+            --panel: rgba(255, 255, 255, 0.96);
+            --panel-strong: #ffffff;
+            --line: rgba(17, 38, 66, 0.14);
+            --line-soft: rgba(17, 38, 66, 0.08);
+            --text: #132238;
+            --muted: #50657d;
+            --accent: #0e7490;
+            --accent-deep: #0f3b57;
+            --success: #1f7a5a;
+            --warm: #ad6a1f;
+            --shadow-sm: 0 6px 16px rgba(16, 30, 50, 0.06);
+            --shadow-md: 0 10px 30px rgba(16, 30, 50, 0.08);
+        }
+        .stApp {
+            background:
+                radial-gradient(circle at top right, rgba(14, 116, 144, 0.08), transparent 24%),
+                linear-gradient(180deg, var(--bg-start) 0%, var(--bg-end) 100%);
+            color: var(--text);
+        }
+        .block-container {
+            padding-top: 1.6rem;
+            padding-bottom: 2rem;
+            max-width: 1400px;
+        }
+        h1, h2, h3 { color: var(--text); letter-spacing: -0.02em; }
+        p, li, label { color: var(--muted); }
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, rgba(15, 35, 57, 0.98) 0%, rgba(9, 24, 41, 0.98) 100%);
+            border-right: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        [data-testid="stSidebar"] * { color: #f5f8fb; }
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: rgba(245, 248, 251, 0.74); }
+        .hero-card,.panel-card,.nav-card,.metric-card,.workflow-card {
+            background: var(--panel);
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            box-shadow: var(--shadow-md);
+        }
+        .hero-card { padding: 1.35rem 1.5rem; margin-bottom: 1rem; border-top: 2px solid rgba(14, 116, 144, 0.25); }
+        .hero-eyebrow { color: var(--accent); text-transform: uppercase; letter-spacing: 0.14em; font-size: 0.74rem; font-weight: 700; margin-bottom: 0.45rem; }
+        .hero-title { color: var(--text); font-size: 2rem; font-weight: 700; margin: 0; }
+        .hero-copy { color: var(--muted); font-size: 0.98rem; line-height: 1.65; margin: 0.65rem 0 0; }
+        .workflow-card,.panel-card { padding: 1.15rem 1.2rem; margin-bottom: 1rem; }
+        .workflow-step { color: var(--text); font-size: 1rem; font-weight: 600; margin-bottom: 0.35rem; }
+        .workflow-copy { color: var(--muted); font-size: 0.92rem; line-height: 1.55; margin: 0; }
+        .section-kicker { color: var(--accent); text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.72rem; font-weight: 700; margin-bottom: 0.25rem; }
+        .section-title { color: var(--text); font-size: 1.55rem; font-weight: 700; margin-bottom: 0.2rem; }
+        .section-copy { color: var(--muted); font-size: 0.95rem; margin-bottom: 0; }
+        .nav-card {
+            padding: 1rem 1rem 0.75rem;
+            margin-bottom: 0.9rem;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 8px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+        }
+        .nav-label { color: #f8fbff; font-size: 0.94rem; font-weight: 700; margin: 0; }
+        .nav-copy { color: rgba(248, 251, 255, 0.74); font-size: 0.82rem; margin: 0.25rem 0 0; line-height: 1.45; }
+        .sidebar-group { color: rgba(248, 251, 255, 0.54); text-transform: uppercase; letter-spacing: 0.12em; font-size: 0.68rem; font-weight: 700; margin: 1rem 0 0.35rem; }
+        .stRadio > div { gap: 0.5rem; }
+        .stRadio label {
+            width: 100%; min-height: 44px; display: flex; align-items: center;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            padding: 0.62rem 0.8rem; margin: 0; box-sizing: border-box; transition: 0.2s ease;
+        }
+        .stRadio label:hover { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.18); }
+        .stRadio label p { margin: 0; font-size: 0.92rem; font-weight: 600; line-height: 1.2; }
+        .stTextInput input,.stTextArea textarea,.stNumberInput input,.stDateInput input,.stSelectbox [data-baseweb="select"] > div {
+            border-radius: 8px; border: 1px solid var(--line-soft); background: #ffffff;
+        }
+        .stForm { background: var(--panel-strong); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1rem 0.4rem; box-shadow: var(--shadow-sm); }
+        .stButton > button,.stForm button,[data-testid="stFormSubmitButton"] > button {
+            border-radius: 8px; border: 1px solid rgba(14, 116, 144, 0.45);
+            background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+            color: #ffffff !important; font-weight: 700; min-height: 2.8rem; padding: 0.58rem 1.1rem;
+        }
+        .ledger-header {
+            color: var(--accent);
+            font-weight: 700;
+            letter-spacing: -0.01em;
+            margin: 0.1rem 0 0.75rem;
+        }
+        .stDataFrame,[data-testid="stDataFrame"] { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow-sm); background: var(--panel-strong); }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
 
 
-def append_inward_record(
-    entry_date: str,
-    vendor: str,
-    item: str,
-    quantity: float,
-    rate: float,
-    payment_terms: str,
-) -> float:
-    total_amount = round(quantity * rate, 2)
-    new_record = {
-        "Date": entry_date,
-        "Vendor": vendor,
-        "Item": item,
-        "Quantity": quantity,
-        "Unit Rate (PKR)": rate,
-        "Total Amount (PKR)": total_amount,
-        "Payment Terms": payment_terms,
-    }
-    existing = load_inward_data()
-    updated = pd.concat([existing, pd.DataFrame([new_record])], ignore_index=True)
-    save_inward_data(updated)
-    return total_amount
-
-
-def load_inward_data() -> pd.DataFrame:
-    cached_inward = _get_session_cached_value("inward_data", INWARD_CACHE_TTL_SECONDS)
-    if isinstance(cached_inward, pd.DataFrame):
-        return cached_inward
-
-    if _is_local_override_enabled("inward"):
-        local_df = safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
-        _set_session_cached_value("inward_data", local_df)
-        return local_df
-
-    if using_google_sheets():
-        df = _sheet_to_df(WS_INWARD, INWARD_COLUMNS)
-        _set_session_cached_value("inward_data", df)
-        return df
-
-    public_df = _public_sheet_to_df(WS_INWARD, INWARD_COLUMNS)
-    if public_df is not None:
-        _set_session_cached_value("inward_data", public_df)
-        return public_df
-
-    local_df = safe_read_csv(INWARD_FILE, INWARD_COLUMNS)
-    _set_session_cached_value("inward_data", local_df)
-    return local_df
-
-
-def save_inward_data(df: pd.DataFrame) -> None:
-    _persist_inward_local_backup(df, source="save_inward_data")
-    _set_session_cached_value("inward_data", df)
-
-    write_success = False
-
-    if google_sheets_write_enabled():
-        if _write_sheet_with_retry(WS_INWARD, df, INWARD_COLUMNS, retries=1):
-            write_success = True
-            _set_local_override("inward", False)
-            return
-        if has_google_service_account():
-            st.warning("Google Sheets sync failed for inward records. Saved locally as fallback.")
-
-    if not write_success:
-        _set_local_override("inward", True)
-
-
-def update_inward_record(
-    row_id: int,
-    entry_date: str,
-    vendor: str,
-    item: str,
-    quantity: float,
-    rate: float,
-    payment_terms: str,
-) -> None:
-    df = load_inward_data()
-    if row_id < 0 or row_id >= len(df):
-        return
-
-    total_amount = round(float(quantity) * float(rate), 2)
-    df.loc[row_id, ["Date", "Vendor", "Item", "Quantity", "Unit Rate (PKR)", "Total Amount (PKR)", "Payment Terms"]] = [
-        entry_date,
-        vendor,
-        item,
-        float(quantity),
-        float(rate),
-        total_amount,
-        payment_terms,
-    ]
-    save_inward_data(df)
-
-
-def delete_inward_record(row_id: int) -> None:
-    df = load_inward_data()
-    if row_id < 0 or row_id >= len(df):
-        return
-    df = df.drop(index=row_id).reset_index(drop=True)
-    save_inward_data(df)
-
-
-def load_payments_data() -> pd.DataFrame:
-    cached_payments = _get_session_cached_value("payments_data", PAYMENT_CACHE_TTL_SECONDS)
-    if isinstance(cached_payments, pd.DataFrame):
-        return cached_payments
-
-    if _is_local_override_enabled("payments"):
-        local_df = safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
-        _set_session_cached_value("payments_data", local_df)
-        return local_df
-
-    if using_google_sheets():
-        df = _sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
-        _set_session_cached_value("payments_data", df)
-        return df
-
-    public_df = _public_sheet_to_df(WS_PAYMENTS, PAYMENT_COLUMNS)
-    if public_df is not None:
-        _set_session_cached_value("payments_data", public_df)
-        return public_df
-
-    local_df = safe_read_csv(PAYMENT_FILE, PAYMENT_COLUMNS)
-    _set_session_cached_value("payments_data", local_df)
-    return local_df
-
-
-def update_payment_record(
-    row_id: int,
-    payment_date: str,
-    vendor: str,
-    amount_paid: float,
-    payment_mode: str,
-    payment_purpose: str,
-    reference_notes: str,
-) -> None:
-    df = load_payments_data()
-    if row_id < 0 or row_id >= len(df):
-        return
-
-    df.loc[row_id, [
-        "Date",
-        "Vendor",
-        "Amount Paid (PKR)",
-        "Payment Mode",
-        "Payment Purpose / Description",
-        "Reference / Notes",
-    ]] = [
-        payment_date,
-        vendor,
-        float(amount_paid),
-        payment_mode,
-        payment_purpose,
-        reference_notes,
-    ]
-    save_payment_data(df)
-
-
-def delete_payment_record(row_id: int) -> None:
-    df = load_payments_data()
-    if row_id < 0 or row_id >= len(df):
-        return
-    df = df.drop(index=row_id).reset_index(drop=True)
-    save_payment_data(df)
-
-
-def append_slip_record(vendor: str, item: str, quantity: int, slip_code: str, filename: str, created_at: str) -> None:
-    if google_sheets_write_enabled():
-        slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
-        new_row = {
-            "slip_code": slip_code,
-            "vendor": vendor,
-            "item": item,
-            "quantity": int(quantity),
-            "created_at": created_at,
-            "filename": filename,
-        }
-        slips_df = pd.concat([slips_df, pd.DataFrame([new_row])], ignore_index=True)
-        if _write_sheet_with_retry(WS_SLIPS, slips_df, SLIP_COLUMNS, retries=1):
-            return
-        if has_google_service_account():
-            st.warning("Google Sheets sync failed for store slip. Saved locally as fallback.")
-
-    save_slip_record(vendor, item, int(quantity), slip_code, filename)
-
-
-def get_recent_slips_store(limit: int = 8):
-    cache_key = f"recent_slips::{int(limit)}"
-    cached_slips = _get_session_cached_value(cache_key, SLIP_CACHE_TTL_SECONDS)
-    if isinstance(cached_slips, list):
-        return cached_slips
-
-    if using_google_sheets():
-        slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
-        if slips_df.empty:
-            _set_session_cached_value(cache_key, [])
-            return []
-        slips_df = slips_df.copy()
-        slips_df["_created_sort"] = pd.to_datetime(slips_df["created_at"], errors="coerce")
-        slips_df = slips_df.sort_values("_created_sort", ascending=False).drop(columns=["_created_sort"])
-        records = []
-        for _, row in slips_df.head(limit).iterrows():
-            records.append((
-                str(row.get("slip_code", "")),
-                str(row.get("vendor", "")),
-                str(row.get("item", "")),
-                int(_safe_float(row.get("quantity", 0), 0)),
-                str(row.get("created_at", "")),
-                str(row.get("filename", "")),
-            ))
-        _set_session_cached_value(cache_key, records)
-        return records
-
-    public_df = _public_sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
-    if public_df is not None and not public_df.empty:
-        slips_df = public_df.copy()
-        slips_df["_created_sort"] = pd.to_datetime(slips_df["created_at"], errors="coerce")
-        slips_df = slips_df.sort_values("_created_sort", ascending=False).drop(columns=["_created_sort"])
-        records = []
-        for _, row in slips_df.head(limit).iterrows():
-            records.append((
-                str(row.get("slip_code", "")),
-                str(row.get("vendor", "")),
-                str(row.get("item", "")),
-                int(_safe_float(row.get("quantity", 0), 0)),
-                str(row.get("created_at", "")),
-                str(row.get("filename", "")),
-            ))
-        _set_session_cached_value(cache_key, records)
-        return records
-
-    fallback_records = get_recent_slips(limit)
-    _set_session_cached_value(cache_key, fallback_records)
-    return fallback_records
-
-
-def lookup_slip_by_barcode(code: str) -> Optional[dict]:
-    code = str(code).strip()
-    if not code:
-        return None
-
-    if using_google_sheets():
-        slips_df = _sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
-        if slips_df.empty:
-            return None
-        match = slips_df[slips_df["slip_code"].astype(str).str.strip() == code]
-        if match.empty:
-            return None
-        row = match.iloc[-1]
-        return {
-            "Vendor": str(row.get("vendor", "")),
-            "Item": str(row.get("item", "")),
-            "Quantity": int(_safe_float(row.get("quantity", 0), 0)),
-        }
-
-    public_df = _public_sheet_to_df(WS_SLIPS, SLIP_COLUMNS)
-    if public_df is not None and not public_df.empty:
-        match = public_df[public_df["slip_code"].astype(str).str.strip() == code]
-        if not match.empty:
-            row = match.iloc[-1]
-            return {
-                "Vendor": str(row.get("vendor", "")),
-                "Item": str(row.get("item", "")),
-                "Quantity": int(_safe_float(row.get("quantity", 0), 0)),
-            }
-
-    barcode_db = "slip_records.db"
-    if not os.path.exists(barcode_db):
-        return None
-
-    try:
-        conn = sqlite3.connect(barcode_db)
-        cursor = conn.cursor()
-        cursor.execute("SELECT vendor, item, quantity FROM slips WHERE slip_code = ?", (code,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return {"Vendor": row[0], "Item": row[1], "Quantity": int(row[2])}
-    except Exception:
-        return None
-    return None
-
-
-def import_transactions_from_json(uploaded_file) -> tuple[bool, str]:
-    """Import transactions from a JSON backup file into the `transactions` table.
-
-    Returns a (success: bool, message: str) tuple.
-    """
-    if uploaded_file is None:
-        return False, "No file provided."
-
-    try:
-        data = json.load(uploaded_file)
-    except Exception as exc:
-        return False, f"Invalid JSON file: {exc}"
-
-    if isinstance(data, dict):
-        if "transactions" in data and isinstance(data["transactions"], list):
-            data = data["transactions"]
-        elif "data" in data and isinstance(data["data"], list):
-            data = data["data"]
-        else:
-            def find_transactions_list(obj, depth=0, max_depth=4):
-                if depth > max_depth:
-                    return None
-                if isinstance(obj, list):
-                    if all(isinstance(x, dict) for x in obj) and len(obj) > 0:
-                        return obj
-                    for item in obj:
-                        res = find_transactions_list(item, depth + 1, max_depth)
-                        if res:
-                            return res
-                    return None
-                if isinstance(obj, dict):
-                    for val in obj.values():
-                        res = find_transactions_list(val, depth + 1, max_depth)
-                        if res:
-                            return res
-                return None
-
-            found = find_transactions_list(data)
-            if found is not None:
-                data = found
-            else:
-                tx_keys = {"date", "description", "amount", "category", "Date", "Description", "Amount", "Category"}
-                if any(key in data for key in tx_keys):
-                    data = [data]
-                else:
-                    return False, "JSON must be an array of transaction objects or contain one under a key like 'transactions' or 'data'."
-    elif not isinstance(data, list):
-        return False, "JSON must be an array of transaction objects or an object containing such an array."
-
-    conn = None
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT,
-                description TEXT,
-                amount REAL,
-                category TEXT
-            )
-            """
-        )
-
-        inserted = 0
-        for obj in data:
-            if not isinstance(obj, dict):
-                continue
-            date_val = obj.get("date") or obj.get("Date") or ""
-            description = obj.get("description") or obj.get("desc") or obj.get("Description") or ""
-            amount = obj.get("amount") or obj.get("Amount") or 0.0
-            category = obj.get("category") or obj.get("Category") or ""
-
-            try:
-                cur.execute(
-                    "INSERT INTO transactions (date, description, amount, category) VALUES (?, ?, ?, ?)",
-                    (str(date_val), description, float(amount or 0.0), category),
-                )
-                inserted += 1
-            except Exception:
-                continue
-
-        conn.commit()
-        return True, f"Imported {inserted} transactions."
-    except Exception as db_exc:
-        return False, f"Database error: {db_exc}"
-    finally:
-        if conn:
-            conn.close()
-
-
-def build_backup_zip() -> tuple[bytes, str]:
-    inward_df = load_inward_data()
-    payments_df = load_payments_data()
-    vendors_data = load_vendor_catalog()
-
-    ledger_items = []
-    for vendor in sorted(vendors_data.keys()):
-        bill_rows = inward_df[inward_df["Vendor"] == vendor] if not inward_df.empty else pd.DataFrame()
-        payment_rows = payments_df[payments_df["Vendor"] == vendor] if not payments_df.empty else pd.DataFrame()
-
-        for _, row in bill_rows.iterrows():
-            ledger_items.append({
-                "Vendor": vendor,
-                "Date": row.get("Date", ""),
-                "Type": "Bill",
-                "Reference": row.get("Item", ""),
-                "Debit (PKR)": row.get("Total Amount (PKR)", 0.0),
-                "Credit (PKR)": 0.0,
-                "Description": row.get("Payment Terms", ""),
-            })
-
-        for _, row in payment_rows.iterrows():
-            ledger_items.append({
-                "Vendor": vendor,
-                "Date": row.get("Date", ""),
-                "Type": "Payment",
-                "Reference": row.get("Voucher No", ""),
-                "Debit (PKR)": 0.0,
-                "Credit (PKR)": row.get("Amount Paid (PKR)", 0.0),
-                "Description": row.get("Payment Purpose / Description", ""),
-            })
-
-    ledger_df = pd.DataFrame(ledger_items)
-    backup_name = f"prexa_erp_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("inward_transactions.csv", inward_df.to_csv(index=False))
-        zf.writestr("vendor_payments.csv", payments_df.to_csv(index=False))
-        zf.writestr("vendor_catalog.json", json.dumps(vendors_data, indent=2))
-        zf.writestr("vendor_ledger.csv", ledger_df.to_csv(index=False))
-
-    return buffer.getvalue(), backup_name
-
-
-def format_bill_label(row: pd.Series) -> str:
-    date_label = row.get("Date", "")
-    item_label = row.get("Item", "")
-    amount_label = row.get("Total Amount (PKR)", 0.0)
-    return f"{date_label} • {item_label} • PKR {amount_label:,.2f}"
-
-
-def format_payment_label(row: pd.Series) -> str:
-    date_label = row.get("Date", "")
-    voucher_no = row.get("Voucher No", "")
-    amount_label = row.get("Amount Paid (PKR)", 0.0)
-    return f"{date_label} • {voucher_no} • PKR {amount_label:,.2f}"
-
-
-def build_ledger_pdf(ledger_rows: list[dict], vendor: str, from_date: datetime.date, to_date: datetime.date) -> bytes:
-    pdf = FPDF(orientation="L", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=10)
-    pdf.set_left_margin(10)
-    pdf.set_right_margin(10)
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 14)
-    pdf.cell(0, 10, f"Vendor Ledger - {vendor}", ln=True)
-    pdf.set_font("Helvetica", "", 9)
-    pdf.cell(0, 8, f"Period: {from_date} to {to_date}", ln=True)
-    pdf.cell(0, 8, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=True)
-    pdf.ln(4)
-
-    def fit_text(text: str, max_width: float) -> str:
-        text = str(text or "")
-        if pdf.get_string_width(text) <= max_width:
-            return text
-        while text and pdf.get_string_width(text + "...") > max_width:
-            text = text[:-1]
-        return f"{text}..." if text else ""
-
-    headers = ["Date", "Reference", "Description", "Debit", "Credit", "Balance"]
-    widths = [24, 80, 120, 26, 26, 26]
-    pdf.set_font("Helvetica", "B", 9)
-    for header, width in zip(headers, widths):
-        pdf.cell(width, 8, header, border=1, align="C")
-    pdf.ln()
-
-    pdf.set_font("Helvetica", "", 8)
-    for row in ledger_rows:
-        date_text = fit_text(row.get("Date", ""), widths[0] - 2)
-        ref_text = fit_text(row.get("Reference", ""), widths[1] - 2)
-        desc_text = fit_text(row.get("Description", ""), widths[2] - 2)
-        debit_text = f"{float(row.get('Debit (PKR)', 0.0)):.2f}"
-        credit_text = f"{float(row.get('Credit (PKR)', 0.0)):.2f}"
-        balance_text = f"{float(row.get('Balance (PKR)', 0.0)):.2f}"
-
-        pdf.cell(widths[0], 6, date_text, border=1)
-        pdf.cell(widths[1], 6, ref_text, border=1)
-        pdf.cell(widths[2], 6, desc_text, border=1)
-        pdf.cell(widths[3], 6, debit_text, border=1, align="R")
-        pdf.cell(widths[4], 6, credit_text, border=1, align="R")
-        pdf.cell(widths[5], 6, balance_text, border=1, align="R")
-        pdf.ln()
-
-    buffer = io.BytesIO()
-    pdf_output = pdf.output(dest="S")
-    if isinstance(pdf_output, str):
-        pdf_bytes = pdf_output.encode("latin-1")
-    elif isinstance(pdf_output, (bytes, bytearray)):
-        pdf_bytes = bytes(pdf_output)
-    else:
-        raise TypeError(f"Unexpected FPDF output type: {type(pdf_output)}")
-    buffer.write(pdf_bytes)
-    buffer.seek(0)
-    return buffer.read()
-
-
-def aggregate_bill_rows(bills_df: pd.DataFrame) -> pd.DataFrame:
-    if bills_df.empty:
-        return bills_df.copy()
-
-    df = bills_df.copy()
-    if "row_id" in df.columns:
-        df = df.drop(columns=["row_id"])
-
-    group_cols = ["Item"]
-    if "Payment Terms" in df.columns:
-        group_cols.append("Payment Terms")
-
-    if "Quantity" in df.columns:
-        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-    if "Total Amount (PKR)" in df.columns:
-        df["Total Amount (PKR)"] = pd.to_numeric(df["Total Amount (PKR)"], errors="coerce").fillna(0)
-
-    if "Unit Rate (PKR)" in df.columns:
-        df["Unit Rate (PKR)"] = pd.to_numeric(df["Unit Rate (PKR)"], errors="coerce").fillna(0)
-        group_cols.append("Unit Rate (PKR)")
-        aggregated = df.groupby(group_cols, dropna=False, as_index=False).agg(
-            {
-                "Quantity": "sum",
-                "Total Amount (PKR)": "sum",
-            }
-        )
-    else:
-        aggregated = df.groupby(group_cols, dropna=False, as_index=False).agg(
-            {
-                "Quantity": "sum",
-                "Total Amount (PKR)": "sum",
-            }
-        )
-
-    if "Unit Rate (PKR)" in aggregated.columns:
-        aggregated["Unit Rate (PKR)"] = aggregated["Unit Rate (PKR)"].round(2)
-    if "Total Amount (PKR)" in aggregated.columns:
-        aggregated["Total Amount (PKR)"] = aggregated["Total Amount (PKR)"].round(2)
-
-    return aggregated
-
-
-ensure_local_data_files()
-_initialize_auth_session()
-if not using_google_sheets():
-    init_slip_db()
-
-selected_page = "Factory Store Slip"
-is_admin = False
-
-# Sidebar Navigation
-with st.sidebar:
-    st.markdown("<div class='sidebar-brand'>PREXA INDUSTRIES</div>", unsafe_allow_html=True)
-    st.markdown("<div class='sidebar-divider'></div>", unsafe_allow_html=True)
-    authenticated_role = _current_authenticated_role()
-    if not authenticated_role:
-        st.markdown("<div class='sidebar-header'>🔐 SECURE LOGIN</div>", unsafe_allow_html=True)
-        login_role = st.radio(
-            "Access level",
-            options=["Store Manager", "Admin"],
-            index=0,
-            key="login_role_selector",
-        )
-
-        if login_role == "Admin":
-            entered_admin_pin = st.text_input("Admin PIN", type="password", key="admin_pin_input")
-            if st.button("Login as admin"):
-                if entered_admin_pin and entered_admin_pin == _admin_pin_value():
-                    _set_authenticated_role(AUTH_ROLE_ADMIN)
-                    st.rerun()
-                else:
-                    st.error("Invalid admin PIN.")
-        else:
-            st.caption("Store Manager access only opens the store slip portal.")
-            if st.button("Enter store slip portal"):
-                _set_authenticated_role(AUTH_ROLE_STORE_MANAGER)
-                st.rerun()
-
-        st.caption("Admin access unlocks financial dashboards, ledgers, payments, vendors, and reports.")
-    else:
-        is_admin = authenticated_role == AUTH_ROLE_ADMIN
-        role_label = "Admin" if is_admin else "Store Manager"
-        st.markdown(f"<div class='sidebar-header'>{role_label} Session</div>", unsafe_allow_html=True)
-
-        menu_pages = ADMIN_PAGES if is_admin else STORE_STAFF_PAGES
-        icon_map = {
-            "Dashboard": "speedometer2",
-            "Factory Store Slip": "upc-scan",
-            "Payments & Voucher": "receipt",
-            "Vendor Bills": "journal-check",
-            "Vendor Ledger": "journal-text",
-            "Vendor Directory": "people-fill",
-            "Items Catalog": "tags-fill",
-            "Reports": "bar-chart-line",
-        }
-        menu_icons = [icon_map.get(page, "circle") for page in menu_pages]
-
-        if st.session_state.app_selected_page not in menu_pages:
-            st.session_state.app_selected_page = menu_pages[0]
-
-        selected_page = option_menu(
-            menu_title=None,
-            options=menu_pages,
-            icons=menu_icons,
-            default_index=menu_pages.index(st.session_state.app_selected_page),
-            styles={
-                "container": {"padding": "0!important", "background-color": "transparent"},
-                "icon": {"color": "#0088CC", "font-size": "18px"},
-                "nav-link": {
-                    "font-size": "15px",
-                    "font-weight": "700",
-                    "text-align": "left",
-                    "margin": "6px 0px",
-                    "color": "#94A3B8",
-                    "padding": "12px 15px",
-                    "border-radius": "8px"
-                },
-                "nav-link-selected": {
-                    "background-color": "#1E3B8A",
-                    "color": "#FFFFFF",
-                    "font-weight": "800",
-                    "box-shadow": "0px 4px 10px rgba(30, 59, 138, 0.4)"
-                },
-            }
-        )
-        st.session_state.app_selected_page = selected_page
-
-        if selected_page not in menu_pages:
-            selected_page = menu_pages[0]
-            st.session_state.app_selected_page = selected_page
-
-        if st.button("Logout"):
-            _logout_current_user()
-            st.rerun()
-
-        st.markdown("---")
-        gs_connected, gs_status_text = google_sheets_status()
-        if st.button("Refresh Google Sheets connection", use_container_width=True):
-            _get_gspread_spreadsheet.clear()
-            _public_sheet_ping.clear()
-            _public_sheet_ping_by_name.clear()
-            _read_public_sheet_csv.clear()
-            _read_public_sheet_by_name.clear()
-            st.rerun()
-
-        if gs_connected:
-            st.success("Google Sheets backup: Active")
-            st.caption(gs_status_text)
-        else:
-            st.info("Google Sheets backup: Local fallback mode")
-            st.caption(gs_status_text)
-
-        if is_admin and st.button("📦 Export Local Backup", use_container_width=True):
-            backup_bytes, backup_name = build_backup_zip()
-            st.download_button(
-                label="Download ERP Backup",
-                data=backup_bytes,
-                file_name=backup_name,
-                mime="application/zip",
-                key="erp_backup_download"
-            )
-        st.caption("⚡ **Prexa ERP v2.0** | Professional Edition")
-
-authenticated_role = _current_authenticated_role()
-if not authenticated_role:
-    st.title("Prexa Industries")
-    st.info("Sign in from the sidebar to continue.")
-    st.stop()
-
-is_admin = authenticated_role == AUTH_ROLE_ADMIN
-vendor_catalog = load_vendor_catalog()
-
-if is_admin:
-    df_inward = load_inward_data()
-    df_payments = load_payments_data()
-else:
-    df_inward = pd.DataFrame(columns=INWARD_COLUMNS)
-    df_payments = pd.DataFrame(columns=PAYMENT_COLUMNS)
-
-# Load Datasets
-if not df_inward.empty:
-    df_inward["Total Amount (PKR)"] = pd.to_numeric(df_inward["Total Amount (PKR)"], errors='coerce').fillna(0)
-if not df_payments.empty:
-    df_payments["Amount Paid (PKR)"] = pd.to_numeric(df_payments["Amount Paid (PKR)"], errors='coerce').fillna(0)
-
-# 1. DASHBOARD
-if selected_page == "Dashboard":
-    st.markdown("<div style='margin-top: 20px;'></div>", unsafe_allow_html=True)
-    st.markdown("### Business Overview & Accounting")
-
-    total_purchases = df_inward["Total Amount (PKR)"].sum() if not df_inward.empty else 0.0
-    total_paid = df_payments["Amount Paid (PKR)"].sum() if not df_payments.empty else 0.0
-    balance_due = total_purchases - total_paid
-    active_vendors = df_inward["Vendor"].nunique() if not df_inward.empty else 0
-
-    col1, col2, col3, col4 = st.columns([1, 1, 1, 1], gap="small")
-    with col1:
-        st.markdown(
-            f"<div class='metric-card accent-1'><h3>Total Purchases</h3><p class='metric-value'>PKR {total_purchases:,.2f}</p></div>",
-            unsafe_allow_html=True,
-        )
-    with col2:
-        st.markdown(
-            f"<div class='metric-card accent-2'><h3>Total Payments</h3><p class='metric-value'>PKR {total_paid:,.2f}</p></div>",
-            unsafe_allow_html=True,
-        )
-    with col3:
-        st.markdown(
-            f"<div class='metric-card accent-3'><h3>Total Payable Balance</h3><p class='metric-value'>PKR {balance_due:,.2f}</p></div>",
-            unsafe_allow_html=True,
-        )
-    with col4:
-        st.markdown(
-            f"<div class='metric-card accent-4'><h3>Active Vendors</h3><p class='metric-value'>{active_vendors}</p></div>",
-            unsafe_allow_html=True,
-        )
-
-    # Monthly purchase and payment trend charts
-    df_trend_inward = df_inward.copy()
-    df_trend_payments = df_payments.copy()
-    if not df_trend_inward.empty:
-        df_trend_inward["Date"] = pd.to_datetime(df_trend_inward["Date"], errors="coerce")
-        df_trend_inward = df_trend_inward.dropna(subset=["Date"])
-        df_trend_inward["Month"] = df_trend_inward["Date"].dt.to_period("M").dt.to_timestamp()
-        monthly_purchases = (
-            df_trend_inward.groupby("Month", as_index=False)["Total Amount (PKR)"].sum().rename(columns={"Total Amount (PKR)": "Purchases"})
-        )
-    else:
-        monthly_purchases = pd.DataFrame({"Month": [], "Purchases": []})
-
-    if not df_trend_payments.empty:
-        df_trend_payments["Date"] = pd.to_datetime(df_trend_payments["Date"], errors="coerce")
-        df_trend_payments = df_trend_payments.dropna(subset=["Date"])
-        df_trend_payments["Month"] = df_trend_payments["Date"].dt.to_period("M").dt.to_timestamp()
-        monthly_payments = (
-            df_trend_payments.groupby("Month", as_index=False)["Amount Paid (PKR)"].sum().rename(columns={"Amount Paid (PKR)": "Payments"})
-        )
-    else:
-        monthly_payments = pd.DataFrame({"Month": [], "Payments": []})
-
-    monthly_trends = pd.merge(monthly_purchases, monthly_payments, on="Month", how="outer").sort_values("Month").fillna(0)
-    if not monthly_trends.empty:
-        monthly_trends = monthly_trends.set_index("Month")
-
-    chart_col1, chart_col2 = st.columns(2, gap="small")
-    with chart_col1:
-        st.markdown("### Monthly Purchase Trend")
-        if not monthly_trends.empty:
-            st.line_chart(monthly_trends[["Purchases"]], height=180)
-        else:
-            st.info("No purchase trend data available.")
-    with chart_col2:
-        st.markdown("### Monthly Payment Trend")
-        if not monthly_trends.empty:
-            st.bar_chart(monthly_trends[["Payments"]], height=180)
-        else:
-            st.info("No payment trend data available.")
-
-    st.markdown("<div class='panel-title'>Recent Activity</div>", unsafe_allow_html=True)
-
-    recent_inwards = df_inward.sort_values("Date", ascending=False).head(5) if not df_inward.empty else pd.DataFrame()
-    recent_payments = df_payments.sort_values("Date", ascending=False).head(5) if not df_payments.empty else pd.DataFrame()
-
-    col_r1, col_r2 = st.columns(2)
-    with col_r1:
-        st.markdown("### Recent Bills")
-        if not recent_inwards.empty:
-            render_controlled_table(recent_inwards[["Date", "Vendor", "Item", "Total Amount (PKR)"]], max_height=230)
-        else:
-            st.info("No recent bills available.")
-    with col_r2:
-        st.markdown("### Recent Payments")
-        if not recent_payments.empty:
-            render_controlled_table(recent_payments[["Date", "Vendor", "Amount Paid (PKR)"]], max_height=230)
-        else:
-            st.info("No recent payments available.")
-
-# 2. FACTORY STORE SLIP
-elif selected_page == "Factory Store Slip":
-    if not is_admin:
-        render_store_manager_portal(vendor_catalog)
-    else:
-        st.markdown("<div class='store-slip-shell'>", unsafe_allow_html=True)
-        st.subheader("🏭 Factory Store Slip")
-        st.caption("Generate unpriced store slips. Rate and total amount are hidden in this interface by design.")
-
-        if not vendor_catalog:
-            st.warning("No vendors are available in the catalog. Add vendors in Vendor Directory first.")
-        else:
-            vendor_options = sorted(vendor_catalog.keys())
-            generate_slip = False
-            print_slip_now = False
-            with st.container(border=True):
-                st.markdown("### Create a store slip")
-                st.caption("Touch-friendly input layout for tablets and mobile screens.")
-                with st.form("factory_slip_form", clear_on_submit=True):
-                    selected_slip_vendor = st.selectbox(
-                        "Vendor",
-                        options=vendor_options,
-                        key="factory_slip_vendor_select",
-                    )
-                    slip_item_name = st.text_input(
-                        "Item name",
-                        key="factory_slip_item_input",
-                        placeholder="Type item name",
-                    )
-                    slip_quantity = st.number_input(
-                        "Quantity",
-                        min_value=1,
-                        value=1,
-                        step=1,
-                        key="factory_slip_quantity_input",
-                    )
-                    st.text_input(
-                        "Date and time",
-                        value=datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        disabled=True,
-                    )
-                    action_col1, action_col2 = st.columns(2)
-                    generate_slip = action_col1.form_submit_button("Generate and save slip")
-                    print_slip_now = action_col2.form_submit_button("🖨️ Print Slip")
-
-            if print_slip_now:
-                latest_print_html = st.session_state.get("factory_last_print_html", "")
-                if not latest_print_html:
-                    st.warning("Generate at least one slip first, then tap Print Slip.")
-                else:
-                    st.session_state.factory_last_print_view_uri = build_print_view_data_uri(latest_print_html)
-                    st.info("Mobile popup blockers can stop automatic printing. Use the open-print-view button below.")
-
-            if generate_slip:
-                normalized_item = to_strict_title_case(slip_item_name)
-                if not normalized_item:
-                    st.error("Item name is required.")
-                else:
-                    slip_code = uuid.uuid4().hex[:12].upper()
-                    created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    slip_image = build_slip_image(
-                        selected_slip_vendor,
-                        normalized_item,
-                        int(slip_quantity),
-                        slip_code,
-                        created_at,
-                    )
-
-                    slip_filename = os.path.join("slips", f"slip_{slip_code}.png")
-                    slip_image.save(slip_filename)
-                    append_slip_record(selected_slip_vendor, normalized_item, int(slip_quantity), slip_code, slip_filename, created_at)
-
-                    append_inward_record(
-                        datetime.now().strftime("%Y-%m-%d"),
-                        selected_slip_vendor,
-                        normalized_item,
-                        float(slip_quantity),
-                        0.0,
-                        "Pending Rate Review",
-                    )
-
-                    st.success("Slip generated and sent to Inward as an unpriced pending entry.")
-
-                    with st.container(border=True):
-                        st.markdown("### Slip details")
-                        st.text_input("Slip code", value=slip_code, disabled=True, key=f"slip_code_{slip_code}")
-                        st.text_input("Date and time", value=created_at, disabled=True, key=f"slip_time_{slip_code}")
-                        st.image(slip_image, caption="Factory store slip preview")
-
-                        buffer = io.BytesIO()
-                        slip_image.save(buffer, format="PNG")
-                        buffer.seek(0)
-                        st.download_button(
-                            "Download slip PNG",
-                            data=buffer,
-                            file_name=f"slip_{slip_code}.png",
-                            mime="image/png",
-                            key=f"download_slip_{slip_code}",
-                        )
-
-                        barcode_uri = to_data_uri(build_barcode_image(slip_code, width=620, height=100))
-                        print_layout_html = build_print_html(
-                            selected_slip_vendor,
-                            normalized_item,
-                            int(slip_quantity),
-                            slip_code,
-                            created_at,
-                            barcode_uri,
-                        )
-                        st.session_state.factory_last_print_html = print_layout_html
-                        st.session_state.factory_last_slip_code = slip_code
-                        st.session_state.factory_last_print_view_uri = build_print_view_data_uri(print_layout_html)
-
-                        with st.expander("Open print-ready layout", expanded=False):
-                            components.html(
-                                print_layout_html,
-                                height=620,
-                            )
-
-            latest_print_view_uri = st.session_state.get("factory_last_print_view_uri", "")
-            latest_print_html = st.session_state.get("factory_last_print_html", "")
-            if latest_print_view_uri and latest_print_html:
-                st.markdown(
-                    f"""
-                    <a href="{latest_print_view_uri}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:block;width:100%;">
-                                        <button style="width:100%;min-height:52px;border-radius:14px;border:1px solid rgba(13,59,102,0.22);background:#ffffff;color:#000000;font-weight:700;font-size:15px;cursor:pointer;">
-                        🖨️ Open printable view in new tab
-                      </button>
-                    </a>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.download_button(
-                    "Download printable HTML",
-                    data=latest_print_html,
-                    file_name="factory_slip_print.html",
-                    mime="text/html",
-                    key="download_printable_slip_html",
-                )
-
-        recent_slips = get_recent_slips_store(8)
-        with st.container(border=True):
-            st.subheader("Recent slips")
-            if recent_slips:
-                render_controlled_table(
-                    pd.DataFrame([
-                        {
-                            "Slip Code": row[0],
-                            "Vendor": row[1],
-                            "Item": row[2],
-                            "Qty": row[3],
-                            "Created": row[4],
-                        }
-                        for row in recent_slips
-                    ]),
-                    show_index=False,
-                )
-            else:
-                st.info("No slips generated yet.")
-
-        with st.container(border=True):
-            st.subheader("📥 Inward records and rate assignment")
-            st.caption("Handle barcode inward capture, manual inward entry, and final rate assignment here.")
-
-        st.markdown("### 📷 Barcode scan / inward entry")
-        with st.form("barcode_form", clear_on_submit=True):
-            barcode_code = st.text_input(
-                "Scan or enter slip barcode",
-                value="",
-                placeholder="Scan barcode here or type the slip code manually",
-                key="barcode_code_input"
-            )
-            scan_btn = st.form_submit_button("Lookup & Record Slip")
-
-        if scan_btn:
-            slip = lookup_slip_by_barcode(barcode_code)
-            if slip is None:
-                st.error("Barcode not found or slip database unavailable.")
-            else:
-                st.session_state.pending_inward_barcode = {
-                    "slip_code": str(barcode_code).strip(),
-                    "vendor": slip["Vendor"],
-                    "item": slip["Item"],
-                    "quantity": int(slip["Quantity"]),
-                }
-                st.success(f"Barcode {st.session_state.pending_inward_barcode['slip_code']} loaded. Edit the rate or other fields below.")
-
-    pending_slip = st.session_state.get("pending_inward_barcode")
-    if pending_slip:
-        with st.container(border=True):
-            st.markdown("### Barcode entry details")
-            st.caption("Edit the slip details before recording the inward entry. Leave the rate blank if you want to store it at zero for now.")
-            with st.form("inward_barcode_entry_form", clear_on_submit=False):
-                slip_date = st.date_input("Date", datetime.now(), key="inward_barcode_date")
-                slip_vendor = st.text_input("Vendor", value=pending_slip["vendor"], key="inward_barcode_vendor")
-                slip_item = st.text_input("Item", value=pending_slip["item"], key="inward_barcode_item")
-                slip_quantity = st.number_input("Quantity", min_value=1, value=int(pending_slip["quantity"]), step=1, key="inward_barcode_quantity")
-                slip_rate_default = float(vendor_catalog.get(slip_vendor, {}).get(slip_item, 0.0))
-                slip_rate_raw = st.text_input(
-                    "Rate (PKR)",
-                    value=f"{slip_rate_default:.2f}" if slip_rate_default else "",
-                    placeholder="Optional: enter a manual rate",
-                    key="inward_barcode_rate",
-                )
-                slip_terms = st.selectbox("Payment Terms", ["Credit", "Cash", "Bank Transfer", "Cheque"], index=0, key="inward_barcode_terms")
-                slip_record_btn = st.form_submit_button("Record inward entry")
-
-            if slip_record_btn:
-                slip_rate = parse_optional_rate(slip_rate_raw)
-                total_amount = append_inward_record(
-                    slip_date.strftime("%Y-%m-%d"),
-                    slip_vendor.strip().title(),
-                    slip_item.strip().title(),
-                    float(slip_quantity),
-                    slip_rate,
-                    slip_terms,
-                )
-                if slip_rate == 0.0:
-                    st.info("Recorded with a zero rate. You can edit the entry below to update the rate at any time.")
-                else:
-                    st.success(f"Inward entry recorded for {slip_vendor} / {slip_item} ({int(slip_quantity)} pcs) with PKR {total_amount:,.2f}.")
-                st.session_state.pop("pending_inward_barcode", None)
-                _refresh_app_data_after_submit()
-
-            if st.button("Clear loaded entry", key="clear_pending_inward_barcode"):
-                st.session_state.pop("pending_inward_barcode", None)
-                st.experimental_rerun()
-
-    with st.expander("Or enter inward entry manually"):
-        with st.form("inward_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            
-            with c1:
-                entry_date = st.date_input("Date", datetime.now())
-                selected_vendor = st.selectbox("Select Vendor", list(vendor_catalog.keys()))
-                vendor_items = list(vendor_catalog[selected_vendor].keys()) if selected_vendor else []
-                selected_item = st.selectbox("Select Item", vendor_items if vendor_items else ["No Items Available"])
-                payment_terms = st.selectbox("Payment Terms", ["Credit", "Cash", "Bank Transfer", "Cheque"])
-
-            with c2:
-                default_rate = vendor_catalog[selected_vendor].get(selected_item, 0.0) if selected_vendor and selected_item in vendor_catalog[selected_vendor] else 0.0
-                quantity = st.number_input("Quantity", min_value=1, value=10, step=1)
-                rate_raw = st.text_input(
-                    "Rate (PKR)",
-                    value=f"{default_rate:.2f}" if default_rate else "",
-                    placeholder="Optional: enter a manual rate",
-                )
-                
-                rate = parse_optional_rate(rate_raw)
-                total_amount = quantity * rate
-                st.markdown(f"### **Total Amount: PKR {total_amount:,.2f}**")
-
-            save_btn = st.form_submit_button("Save Inward Entry")
-
-            if save_btn:
-                if not selected_item or selected_item == "No Items Available":
-                    st.error("Please select a valid item.")
-                else:
-                    append_inward_record(
-                        entry_date.strftime("%Y-%m-%d"),
-                        selected_vendor.strip().title(),
-                        selected_item.strip().title(),
-                        float(quantity),
-                        rate,
-                        payment_terms,
-                    )
-                    st.success("Inward entry saved successfully!")
-                    _refresh_app_data_after_submit()
-
-    st.markdown("---")
-    st.subheader("📊 Recent Inward Records")
-    render_controlled_table(df_inward, show_index=False)
-
-    if not df_inward.empty:
-        st.markdown("---")
-        st.subheader("✏️ Manage Inward Records")
-        inward_manage = df_inward.reset_index().rename(columns={"index": "row_id"})
-        selected_inward = st.selectbox(
-            "Select record to edit or delete",
-            options=inward_manage["row_id"].tolist(),
-            format_func=lambda rid: f"{inward_manage.loc[inward_manage['row_id'] == rid, 'Date'].iloc[0]} — {inward_manage.loc[inward_manage['row_id'] == rid, 'Vendor'].iloc[0]} / {inward_manage.loc[inward_manage['row_id'] == rid, 'Item'].iloc[0]}",
-            key="manage_inward_select",
-        )
-        selected_row = inward_manage[inward_manage["row_id"] == selected_inward].iloc[0]
-        with st.expander("Edit selected inward record"):
-            edit_date = st.date_input(
-                "Date",
-                value=pd.to_datetime(selected_row["Date"], errors="coerce").date() if pd.notna(selected_row["Date"]) else datetime.now().date(),
-                key="edit_inward_date",
-            )
-            edit_vendor = st.text_input("Vendor", value=selected_row["Vendor"], key="edit_inward_vendor")
-            edit_item = st.text_input("Item", value=selected_row["Item"], key="edit_inward_item")
-            edit_quantity = st.number_input("Quantity", min_value=0.0, value=float(selected_row["Quantity"]), step=1.0, key="edit_inward_quantity")
-            edit_rate = st.number_input("Unit Rate (PKR)", min_value=0.0, value=float(selected_row["Unit Rate (PKR)"],), step=1.0, key="edit_inward_rate")
-            edit_payment_terms = st.selectbox(
-                "Payment Terms",
-                ["Credit", "Cash", "Bank Transfer", "Cheque"],
-                index=["Credit", "Cash", "Bank Transfer", "Cheque"].index(selected_row["Payment Terms"]) if selected_row["Payment Terms"] in ["Credit", "Cash", "Bank Transfer", "Cheque"] else 0,
-                key="edit_inward_terms",
-            )
-            computed_total = round(edit_quantity * edit_rate, 2)
-            st.markdown(f"**Computed Total Amount:** PKR {computed_total:,.2f}")
-            if st.button("Save Inward Changes", key="save_inward_changes"):
-                update_inward_record(
-                    int(selected_inward),
-                    edit_date.strftime("%Y-%m-%d"),
-                    edit_vendor.strip().title(),
-                    edit_item.strip().title(),
-                    edit_quantity,
-                    edit_rate,
-                    edit_payment_terms,
-                )
-                st.success("Inward record updated successfully.")
-                _refresh_app_data_after_submit()
-
-        with st.expander("Delete selected inward record"):
-            st.warning("This will permanently remove the selected inward record.")
-            confirm_inward_delete = st.checkbox("I understand this action cannot be undone.", key="confirm_delete_inward")
-            if confirm_inward_delete and st.button("Delete Inward Record", key="delete_inward_record"):
-                delete_inward_record(int(selected_inward))
-                st.success("Inward record deleted successfully.")
-                _refresh_app_data_after_submit()
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# 3. PAYMENTS & VOUCHER
-elif selected_page == "Payments & Voucher":
-    st.subheader("💳 Vendor Payments & Voucher Generator")
-
-    col_pay1, col_pay2 = st.columns([1, 1])
-
-    with col_pay1:
-        st.markdown("### 💵 Record Payment & Create Voucher")
-        next_v_num = f"PV-{len(df_payments) + 1001}"
-        
-        with st.form("payment_form", clear_on_submit=False):
-            st.info(f"**Generated Voucher No:** {next_v_num}")
-            p_date = st.date_input("Payment Date", datetime.now())
-            p_vendor = st.selectbox("Vendor Name", list(vendor_catalog.keys()), key="p_v")
-            p_amount = st.number_input("Amount Paid (PKR)", min_value=1.0, step=500.0)
-            p_mode = st.selectbox("Payment Mode", ["Cash", "Bank Transfer", "Cheque", "Online"])
-            p_purpose = st.text_area("Payment Purpose / Description", placeholder="E.g. Payment for Iris Scissors")
-            p_notes = st.text_input("Reference / Notes", placeholder="Cheque No / Bank Ref")
-
-            pay_btn = st.form_submit_button("Save Payment & Generate Voucher")
-
-            if pay_btn:
-                new_pay = pd.DataFrame([{
-                    "Voucher No": next_v_num,
-                    "Date": p_date.strftime("%Y-%m-%d"),
-                    "Vendor": p_vendor,
-                    "Amount Paid (PKR)": p_amount,
-                    "Payment Mode": p_mode,
-                    "Payment Purpose / Description": p_purpose if p_purpose else "Payment Made against Inward/Job",
-                    "Reference / Notes": p_notes if p_notes else "-"
-                }])
-                existing_payments = load_payments_data()
-                save_payment_data(pd.concat([existing_payments, new_pay], ignore_index=True))
-                st.session_state['selected_voucher'] = next_v_num
-                st.success(f"✅ Payment Saved! Voucher {next_v_num} created successfully.")
-                _refresh_app_data_after_submit()
-
-    with col_pay2:
-        st.markdown("### 🔍 Select Vendor Ledger View")
-        selected_ledger_vendor = st.selectbox("Choose Vendor", list(vendor_catalog.keys()), key="ledger_v")
-
-        v_inwards = df_inward[df_inward["Vendor"] == selected_ledger_vendor] if not df_inward.empty else pd.DataFrame()
-        v_pays = df_payments[df_payments["Vendor"] == selected_ledger_vendor] if not df_payments.empty else pd.DataFrame()
-
-        total_in = v_inwards["Total Amount (PKR)"].sum() if not v_inwards.empty else 0.0
-        total_out = v_pays["Amount Paid (PKR)"].sum() if not v_pays.empty else 0.0
-        net_bal = total_in - total_out
-
-        st.info(f"**Total Purchases:** PKR {total_in:,.2f} | **Total Paid:** PKR {total_out:,.2f}")
-        if net_bal > 0:
-            st.warning(f"**Net Outstanding Payable:** PKR {net_bal:,.2f}")
-        else:
-            st.success(f"**Account Clear / Advance:** PKR {abs(net_bal):,.2f}")
-
-    st.markdown("---")
-    st.markdown("### 📄 Payment Voucher Preview & Print")
-    
-    df_payments_current = load_payments_data()
-    
-    if not df_payments_current.empty:
-        voucher_options = df_payments_current["Voucher No"].tolist()
-        default_index = len(voucher_options) - 1
-        if 'selected_voucher' in st.session_state and st.session_state['selected_voucher'] in voucher_options:
-            default_index = voucher_options.index(st.session_state['selected_voucher'])
-
-        selected_v_no = st.selectbox("Select Voucher to Print:", voucher_options, index=default_index)
-        v_row = df_payments_current[df_payments_current["Voucher No"] == selected_v_no].iloc[0]
-
-        voucher_html = f"""
-        <div class='voucher-box'>
-            <div style='display:flex; justify-content:space-between; align-items:center;'>
-                <div>
-                    <h2 style='color:#000000; margin:0; font-weight:800; font-size:24px;'>PREXA INDUSTRIES</h2>
-                    <p style='margin:0; font-size:12px; color:#000000;'>Surgical, Dental & Manicure Instruments</p>
-                    <p style='margin:0; font-size:12px; color:#000000;'>2Km Kingra Road Kakeywali, Sialkot - Pakistan</p>
-                </div>
-                <div style='text-align:right;'>
-                    <h3 style='margin:0; color:#000000; text-decoration: underline; font-size:18px;'>PAYMENT VOUCHER</h3>
-                    <p style='margin:4px 0 0 0; font-weight:bold; font-size:14px;'>Voucher No: {v_row.get('Voucher No', 'N/A')}</p>
-                    <p style='margin:0; font-size:12px;'>Date: {v_row.get('Date', 'N/A')}</p>
-                </div>
-            </div>
-            <hr style='border:1px solid #1E3B8A; margin:10px 0;'>
-            <table class='voucher-table'>
-                <tr>
-                    <td style='width:50%;'><strong>Paid To (Vendor / Contractor):</strong><br><span style='font-size:15px;'>{v_row.get('Vendor', '')}</span></td>
-                    <td style='width:50%;'><strong>Payment Mode:</strong><br>{v_row.get('Payment Mode', '')}</td>
-                </tr>
-                <tr>
-                    <td colspan='2' style='background-color: #F8FAFC;'><strong>Amount Paid:</strong><br><span style='font-size:20px; font-weight:bold; color:#000000;'>PKR {float(v_row.get('Amount Paid (PKR)', 0)):,.2f}</span></td>
-                </tr>
-                <tr>
-                    <td colspan='2'><strong>Payment Purpose / Description:</strong><br><span style='font-size:14px;'>{v_row.get('Payment Purpose / Description', '')}</span></td>
-                </tr>
-                <tr>
-                    <td colspan='2'><strong>Reference / Bank / Cheque Details:</strong><br>{v_row.get('Reference / Notes', '-')}</td>
-                </tr>
-            </table>
-            <div class='sig-space'>
-                <div class='sig-line'>Prepared / Paid By (Cashier)</div>
-                <div class='sig-line'>Approved By (Manager)</div>
-                <div class='sig-line'>Vendor Receiver Signature</div>
-            </div>
+def render_hero(title: str, copy: str, eyebrow: str) -> None:
+    st.markdown(
+        f"""
+        <div class="hero-card">
+            <div class="hero-eyebrow">{eyebrow}</div>
+            <h1 class="hero-title">{title}</h1>
+            <p class="hero-copy">{copy}</p>
         </div>
-        """
-        st.markdown(voucher_html, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-        voucher_print_html = f"""
-        <html>
-            <head>
-                <meta charset='utf-8'>
-                <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-                <title>Payment Voucher {v_row.get('Voucher No', 'N/A')}</title>
-                <style>
-                    body {{
-                        margin: 0;
-                        padding: 16px;
-                        background: #ffffff;
-                        color: #000000;
-                        font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                    }}
-                    .print-shell {{ max-width: 900px; margin: 0 auto; }}
-                    .voucher-box {{ border: 1px solid rgba(15, 23, 42, 0.14); border-radius: 14px; box-shadow: none; }}
-                    .voucher-table {{ width: 100%; border-collapse: collapse; }}
-                    .voucher-table td, .voucher-table th {{ border: 1px solid rgba(148, 163, 184, 0.25); color: #000000; }}
-                    .sig-line {{ color: #000000; }}
-                </style>
-            </head>
-            <body>
-                <div class='print-shell'>
-                    {voucher_html}
-                </div>
-            </body>
-        </html>
-        """
 
-        voucher_print_uri = build_print_view_data_uri(voucher_print_html)
-        st.markdown(
-            f"""
-            <a href="{voucher_print_uri}" target="_blank" rel="noopener noreferrer" style="text-decoration:none;display:block;width:100%;">
-                <button style="width:100%;min-height:48px;border-radius:12px;border:1px solid rgba(13,59,102,0.22);background:#ffffff;color:#000000;font-weight:700;font-size:14px;cursor:pointer;">
-                    🖨️ Open voucher printable view in new tab
-                </button>
-            </a>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.download_button(
-            "Download voucher printable HTML",
-            data=voucher_print_html,
-            file_name=f"voucher_{v_row.get('Voucher No', 'N_A')}.html",
-            mime="text/html",
-            key=f"download_voucher_html_{selected_v_no}",
-        )
+def render_section_intro(section: str) -> None:
+    config = SECTION_CONFIG[section]
+    st.markdown(
+        f"""
+        <div class="panel-card">
+            <div class="section-kicker">{config['group']}</div>
+            <div class="section-title">{config['label']}</div>
+            <p class="section-copy">{config['caption']}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.markdown("---")
-    st.markdown(f"### 📑 Account History for **{selected_ledger_vendor}**")
-    t1, t2 = st.tabs(["📦 Inward Bills History", "💵 Payment History"])
-    with t1:
-        render_controlled_table(v_inwards, show_index=False)
-    with t2:
-        render_controlled_table(v_pays, show_index=False)
 
-    if not df_payments_current.empty:
+def render_metric_card(column, label: str, value: str, subtext: str) -> None:
+    column.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="section-kicker">{label}</div>
+            <div class="section-title" style="font-size:1.8rem;">{value}</div>
+            <p class="section-copy">{subtext}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_navigation(available_sections: list[str]) -> str:
+    ordered_sections = [
+        section
+        for section in [
+            "dashboard",
+            "vendors",
+            "items",
+            "receipts",
+            "inward_summary",
+            "vendor_ledger",
+            "payment_slips",
+            "users",
+        ]
+        if section in available_sections
+    ]
+
+    with st.sidebar:
+        st.markdown("### Prexa ERP Navigation")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
         st.markdown("---")
-        st.subheader("✏️ Manage Payments")
-        payments_manage = df_payments_current.reset_index().rename(columns={"index": "row_id"})
-        selected_payment = st.selectbox(
-            "Select payment to edit or delete",
-            options=payments_manage["row_id"].tolist(),
-            format_func=lambda rid: f"{payments_manage.loc[payments_manage['row_id'] == rid, 'Date'].iloc[0]} — {payments_manage.loc[payments_manage['row_id'] == rid, 'Vendor'].iloc[0]} / {payments_manage.loc[payments_manage['row_id'] == rid, 'Voucher No'].iloc[0]}",
-            key="manage_payment_select",
+
+        return st.radio(
+            "Go to",
+            options=ordered_sections,
+            label_visibility="collapsed",
+            format_func=lambda value: SECTION_CONFIG[value]["label"],
         )
-        payment_row = payments_manage[payments_manage["row_id"] == selected_payment].iloc[0]
 
-        with st.expander("Edit selected payment"):
-            edit_p_date = st.date_input(
-                "Payment Date",
-                value=pd.to_datetime(payment_row["Date"], errors="coerce").date() if pd.notna(payment_row["Date"]) else datetime.now().date(),
-                key="edit_payment_date",
-            )
-            edit_p_vendor = st.text_input("Vendor", value=payment_row["Vendor"], key="edit_payment_vendor")
-            edit_p_amount = st.number_input("Amount Paid (PKR)", min_value=0.0, value=float(payment_row["Amount Paid (PKR)"],), step=1.0, key="edit_payment_amount")
-            edit_p_mode = st.selectbox(
-                "Payment Mode",
-                ["Cash", "Bank Transfer", "Cheque", "Online"],
-                index=["Cash", "Bank Transfer", "Cheque", "Online"].index(payment_row["Payment Mode"]) if payment_row["Payment Mode"] in ["Cash", "Bank Transfer", "Cheque", "Online"] else 0,
-                key="edit_payment_mode",
-            )
-            edit_purpose = st.text_area("Payment Purpose / Description", value=payment_row["Payment Purpose / Description"], key="edit_payment_purpose")
-            edit_notes = st.text_input("Reference / Notes", value=payment_row["Reference / Notes"], key="edit_payment_notes")
-            if st.button("Save Payment Changes", key="save_payment_changes"):
-                update_payment_record(
-                    int(selected_payment),
-                    edit_p_date.strftime("%Y-%m-%d"),
-                    edit_p_vendor.strip().title(),
-                    edit_p_amount,
-                    edit_p_mode,
-                    edit_purpose,
-                    edit_notes,
-                )
-                st.success("Payment record updated successfully.")
-                _refresh_app_data_after_submit()
 
-        with st.expander("Delete selected payment"):
-            st.warning("This will permanently remove the selected payment record.")
-            confirm_payment_delete = st.checkbox("I understand this action cannot be undone.", key="confirm_delete_payment")
-            if confirm_payment_delete and st.button("Delete Payment Record", key="delete_payment_record"):
-                delete_payment_record(int(selected_payment))
-                st.success("Payment record deleted successfully.")
-                _refresh_app_data_after_submit()
+def render_connection_controls() -> None:
+    with st.sidebar.expander("Supabase Connection", expanded=False):
+        st.caption("Optional: set SUPABASE_URL / SUPABASE_ANON_KEY or enter credentials here. Without these, the app runs in local mode.")
+        url = st.text_input(
+            "Supabase URL",
+            value=st.session_state.get("supabase_url_input", ""),
+            placeholder="https://your-project-ref.supabase.co",
+        )
+        key = st.text_input(
+            "Supabase API Key",
+            value=st.session_state.get("supabase_key_input", ""),
+            type="password",
+            placeholder="paste-anon-or-service-role-key",
+        )
+        if st.button("Apply Connection", use_container_width=True):
+            st.session_state["supabase_url_input"] = url.strip()
+            st.session_state["supabase_key_input"] = key.strip()
+            build_supabase_client.clear()
+            st.rerun()
 
-# 5. VENDOR BILLS
-elif selected_page == "Vendor Bills":
-    st.subheader("🧾 Vendor Bills")
-    st.caption("Review, edit, and delete inward bills and payment records for each vendor.")
 
-    if not vendor_catalog:
-        st.warning("No vendors available yet.")
-    else:
-        selected_vendor = st.selectbox("Select Vendor", sorted(vendor_catalog.keys()), key="vendor_bills_vendor")
-        v_inwards = df_inward[df_inward["Vendor"] == selected_vendor].copy() if not df_inward.empty else pd.DataFrame(columns=df_inward.columns)
-        v_payments = df_payments[df_payments["Vendor"] == selected_vendor].copy() if not df_payments.empty else pd.DataFrame(columns=df_payments.columns)
+def render_login(client: SupabaseClient) -> None:
+    left, right = st.columns([1.15, 0.85])
+    with left:
+        render_hero(
+            "Prexa Industries ERP",
+            "Control the full inbound workflow for surgical manufacturing and export orders.",
+            "Prexa Industries",
+        )
 
-        total_bills = v_inwards["Total Amount (PKR)"].sum() if not v_inwards.empty else 0.0
-        total_paid = v_payments["Amount Paid (PKR)"].sum() if not v_payments.empty else 0.0
-        remaining_balance = total_bills - total_paid
+    with right:
+        with st.form("login_form", clear_on_submit=False):
+            st.markdown("### Secure Sign In")
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Login", use_container_width=True)
 
-        st.markdown("<div class='kpi-group'>", unsafe_allow_html=True)
-        st.markdown(f"<div class='kpi-card'><h3>Vendor inward bills</h3><p class='kpi-value'>PKR {total_bills:,.2f}</p></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='kpi-card'><h3>Vendor payments</h3><p class='kpi-value'>PKR {total_paid:,.2f}</p></div>", unsafe_allow_html=True)
-        balance_class = 'kpi-card warning' if remaining_balance > 0 else 'kpi-card'
-        st.markdown(f"<div class='{balance_class}'><h3>Current balance</h3><p class='kpi-value'>PKR {remaining_balance:,.2f}</p></div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        bills_tab, payments_tab = st.tabs(["Bills", "Payments"])
-
-        with bills_tab:
-            if v_inwards.empty:
-                st.info("No vendor bills found.")
+        if submitted:
+            user = authenticate(client, username, password)
+            if user:
+                st.session_state["user"] = user
+                st.success("Login successful.")
+                st.rerun()
             else:
-                bills_df = v_inwards.reset_index(drop=False).rename(columns={"index": "row_id"})
-                render_controlled_table(
-                    bills_df[["row_id", "Date", "Item", "Quantity", "Unit Rate (PKR)", "Total Amount (PKR)", "Payment Terms"]],
-                    show_index=False,
-                )
+                st.error("Invalid username or password.")
 
-                selected_bill_id = st.selectbox(
-                    "Select bill to edit or delete",
-                    options=bills_df["row_id"].tolist(),
-                    format_func=lambda idx: format_bill_label(bills_df.loc[bills_df["row_id"] == idx].iloc[0]),
-                    key="vendor_bill_select",
-                )
-                selected_bill = bills_df[bills_df["row_id"] == selected_bill_id].iloc[0]
 
-                with st.expander("Edit selected bill"):
-                    edit_date = st.date_input("Bill date", value=pd.to_datetime(selected_bill["Date"], errors="coerce").date() if pd.notna(selected_bill["Date"]) else datetime.now().date(), key=f"edit_bill_date_{selected_bill_id}")
-                    edit_item = st.text_input("Item", value=selected_bill["Item"], key=f"edit_bill_item_{selected_bill_id}")
-                    edit_quantity = st.number_input("Quantity", min_value=0.0, value=float(selected_bill["Quantity"]), step=1.0, key=f"edit_bill_quantity_{selected_bill_id}")
-                    edit_rate_raw = st.text_input(
-                        "Unit rate (PKR)",
-                        value=f"{float(selected_bill['Unit Rate (PKR)']):.2f}" if float(selected_bill["Unit Rate (PKR)"]) else "",
-                        placeholder="Optional: enter or change the rate",
-                        key=f"edit_bill_rate_{selected_bill_id}",
-                    )
-                    edit_rate = parse_optional_rate(edit_rate_raw)
-                    edit_payment_terms = st.selectbox(
-                        "Payment terms",
-                        ["Credit", "Cash", "Bank Transfer", "Cheque"],
-                        index=["Credit", "Cash", "Bank Transfer", "Cheque"].index(selected_bill["Payment Terms"]) if selected_bill["Payment Terms"] in ["Credit", "Cash", "Bank Transfer", "Cheque"] else 0,
-                        key=f"edit_bill_terms_{selected_bill_id}",
-                    )
-                    edit_total = round(edit_quantity * edit_rate, 2)
-                    st.markdown(f"**Computed total:** PKR {edit_total:,.2f}")
-                    if st.button("Save bill changes", key=f"save_bill_changes_{selected_bill_id}"):
-                        df_inward.loc[selected_bill_id, ["Date", "Item", "Quantity", "Unit Rate (PKR)", "Total Amount (PKR)", "Payment Terms"]] = [
-                            edit_date.strftime("%Y-%m-%d"),
-                            edit_item.strip().title(),
-                            edit_quantity,
-                            edit_rate,
-                            edit_total,
-                            edit_payment_terms,
-                        ]
-                        save_inward_data(df_inward)
-                        st.success("Bill updated successfully.")
-                        _refresh_app_data_after_submit()
+def render_header() -> None:
+    if st.sidebar.button("Logout", use_container_width=True):
+        st.session_state["user"] = None
+        st.rerun()
 
-                with st.expander("Delete selected bill"):
-                    st.warning("This will permanently delete the selected bill.")
-                    confirm_bill_delete = st.checkbox("I understand this action cannot be undone.", key=f"confirm_delete_bill_{selected_bill_id}")
-                    if confirm_bill_delete and st.button("Delete bill", key=f"delete_bill_{selected_bill_id}"):
-                        df_inward.drop(index=selected_bill_id, inplace=True)
-                        save_inward_data(df_inward)
-                        st.success("Bill deleted successfully.")
-                        _refresh_app_data_after_submit()
 
-        with payments_tab:
-            if v_payments.empty:
-                st.info("No vendor payments found.")
-            else:
-                payments_df = v_payments.reset_index(drop=False).rename(columns={"index": "row_id"})
-                render_controlled_table(
-                    payments_df[["row_id", "Voucher No", "Date", "Amount Paid (PKR)", "Payment Mode", "Payment Purpose / Description"]],
-                    show_index=False,
-                )
+def render_dashboard(client: SupabaseClient) -> None:
+    vendors = fetch_vendors(client)
+    items = fetch_items(client)
+    receipts = fetch_receipts(client)
+    lots = fetch_inward_lots(client)
+    payment_slips = fetch_payment_slips(client)
 
-                selected_payment_id = st.selectbox(
-                    "Select payment to edit or delete",
-                    options=payments_df["row_id"].tolist(),
-                    format_func=lambda idx: format_payment_label(payments_df.loc[payments_df["row_id"] == idx].iloc[0]),
-                    key="vendor_payment_select",
-                )
-                selected_payment = payments_df[payments_df["row_id"] == selected_payment_id].iloc[0]
+    stock_value = sum(float(item.get("stock_on_hand", 0)) * float(item.get("unit_price", 0)) for item in items)
+    low_stock = sum(1 for item in items if float(item.get("stock_on_hand", 0)) <= 10)
 
-                with st.expander("Edit selected payment"):
-                    edit_p_date = st.date_input("Payment date", value=pd.to_datetime(selected_payment["Date"], errors="coerce").date() if pd.notna(selected_payment["Date"]) else datetime.now().date(), key=f"edit_payment_date_{selected_payment_id}")
-                    edit_p_amount = st.number_input("Amount paid (PKR)", min_value=0.0, value=float(selected_payment["Amount Paid (PKR)"]), step=1.0, key=f"edit_payment_amount_{selected_payment_id}")
-                    edit_p_mode = st.selectbox(
-                        "Payment mode",
-                        ["Cash", "Bank Transfer", "Cheque", "Online"],
-                        index=["Cash", "Bank Transfer", "Cheque", "Online"].index(selected_payment["Payment Mode"]) if selected_payment["Payment Mode"] in ["Cash", "Bank Transfer", "Cheque", "Online"] else 0,
-                        key=f"edit_payment_mode_{selected_payment_id}",
-                    )
-                    edit_purpose = st.text_area("Payment purpose / description", value=selected_payment["Payment Purpose / Description"], key=f"edit_payment_purpose_{selected_payment_id}")
-                    edit_notes = st.text_input("Reference / notes", value=selected_payment["Reference / Notes"], key=f"edit_payment_notes_{selected_payment_id}")
-                    if st.button("Save payment changes", key=f"save_payment_changes_{selected_payment_id}"):
-                        df_payments.loc[selected_payment_id, ["Date", "Amount Paid (PKR)", "Payment Mode", "Payment Purpose / Description", "Reference / Notes"]] = [
-                            edit_p_date.strftime("%Y-%m-%d"),
-                            edit_p_amount,
-                            edit_p_mode,
-                            edit_purpose,
-                            edit_notes,
-                        ]
-                        save_payment_data(df_payments)
-                        st.success("Payment updated successfully.")
-                        _refresh_app_data_after_submit()
+    render_section_intro("dashboard")
+    col1, col2, col3, col4 = st.columns(4)
+    render_metric_card(col1, "Approved Vendors", str(len(vendors)), "Qualified sourcing base")
+    render_metric_card(col2, "Active SKUs", str(len(items)), "Tracked for production")
+    render_metric_card(col3, "Inward Entries", str(len(receipts)), "Auto-rated from item master")
+    render_metric_card(col4, "Payment Slips", str(len(payment_slips)), f"Low stock items: {low_stock}")
 
-                with st.expander("Delete selected payment"):
-                    st.warning("This will permanently delete the selected payment.")
-                    confirm_payment_delete = st.checkbox("I understand this action cannot be undone.", key=f"confirm_delete_payment_{selected_payment_id}")
-                    if confirm_payment_delete and st.button("Delete payment", key=f"delete_payment_{selected_payment_id}"):
-                        df_payments.drop(index=selected_payment_id, inplace=True)
-                        save_payment_data(df_payments)
-                        st.success("Payment deleted successfully.")
-                        _refresh_app_data_after_submit()
-
-# 5. VENDOR LEDGER
-elif selected_page == "Vendor Ledger":
-    st.subheader("📘 Vendor Ledger")
-    st.caption("View a dedicated vendor ledger with debit, credit and running balances.")
-
-    if not vendor_catalog:
-        st.warning("No vendors available yet.")
-    else:
-        selected_vendor = st.selectbox("Select Vendor", sorted(vendor_catalog.keys()))
-        v_inwards = df_inward[df_inward["Vendor"] == selected_vendor].copy() if not df_inward.empty else pd.DataFrame(columns=df_inward.columns)
-        v_payments = df_payments[df_payments["Vendor"] == selected_vendor].copy() if not df_payments.empty else pd.DataFrame(columns=df_payments.columns)
-
-        if "Date" in v_inwards.columns:
-            v_inwards["Date"] = pd.to_datetime(v_inwards["Date"], errors="coerce")
-        if "Date" in v_payments.columns:
-            v_payments["Date"] = pd.to_datetime(v_payments["Date"], errors="coerce")
-
-        col_filter1, col_filter2 = st.columns(2)
-        with col_filter1:
-            from_date = st.date_input("From Date", value=datetime.now().date().replace(day=1), key="ledger_from_date")
-        with col_filter2:
-            to_date = st.date_input("To Date", value=datetime.now().date(), key="ledger_to_date")
-
-        if from_date > to_date:
-            st.error("From Date cannot be later than To Date.")
-            filtered_inwards = pd.DataFrame(columns=v_inwards.columns)
-            filtered_payments = pd.DataFrame(columns=v_payments.columns)
-        else:
-            filtered_inwards = v_inwards[
-                (v_inwards["Date"].dt.date >= from_date) &
-                (v_inwards["Date"].dt.date <= to_date)
-            ] if not v_inwards.empty else pd.DataFrame(columns=v_inwards.columns)
-            filtered_payments = v_payments[
-                (v_payments["Date"].dt.date >= from_date) &
-                (v_payments["Date"].dt.date <= to_date)
-            ] if not v_payments.empty else pd.DataFrame(columns=v_payments.columns)
-
-        history = []
-        if not filtered_inwards.empty:
-            for _, row in filtered_inwards.sort_values("Date", ascending=True).iterrows():
-                history.append({
-                    "Date": row["Date"].strftime("%Y-%m-%d") if not pd.isna(row["Date"]) else "",
-                    "Description": f"Inward bill for {row.get('Item', 'goods')}",
-                    "Reference": row.get("Item", "Inward Entry"),
-                    "Debit (PKR)": row.get("Total Amount (PKR)", 0.0),
-                    "Credit (PKR)": 0.0,
-                })
-        if not filtered_payments.empty:
-            for _, row in filtered_payments.sort_values("Date", ascending=True).iterrows():
-                history.append({
-                    "Date": row["Date"].strftime("%Y-%m-%d") if not pd.isna(row["Date"]) else "",
-                    "Description": row.get("Payment Purpose / Description", "Vendor payment"),
-                    "Reference": row.get("Voucher No", "Payment"),
-                    "Debit (PKR)": 0.0,
-                    "Credit (PKR)": row.get("Amount Paid (PKR)", 0.0),
-                })
-
-        vendor_balance = 0.0
-        ledger_rows = []
-        for row in sorted(history, key=lambda x: (x.get("Date", ""), x.get("Reference", ""))):
-            vendor_balance = round(vendor_balance + float(row.get("Debit (PKR)", 0.0)) - float(row.get("Credit (PKR)", 0.0)), 2)
-            ledger_rows.append({
-                "Date": row.get("Date", ""),
-                "Reference": row.get("Reference", ""),
-                "Description": row.get("Description", ""),
-                "Debit (PKR)": row.get("Debit (PKR)", 0.0),
-                "Credit (PKR)": row.get("Credit (PKR)", 0.0),
-                "Balance (PKR)": vendor_balance,
-            })
-
-        st.markdown("<div class='ledger-card'>", unsafe_allow_html=True)
-        if ledger_rows:
-            ledger_df = pd.DataFrame(ledger_rows)
-            render_controlled_table(ledger_df, show_index=False)
-            col_print, col_pdf = st.columns([1, 1])
-            with col_print:
-                if st.button("Open Print View"):
-                    html = f"""
-                    <html>
-                      <head>
-                        <meta charset='utf-8'>
-                        <style>
-                          body {{ font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 24px; background: #fff; color: #000000; }}
-                          h1 {{ font-size: 24px; margin-bottom: 8px; }}
-                          table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
-                          th, td {{ border: 1px solid #ddd; padding: 10px; font-size: 13px; }}
-                          th {{ background: #f4f6fb; text-align: left; }}
-                        </style>
-                      </head>
-                      <body onload='window.print()'>
-                        <h1>Vendor Ledger - {selected_vendor}</h1>
-                        <p><strong>Period:</strong> {from_date} to {to_date}</p>
-                        <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-                        {ledger_df.to_html(index=False)}
-                      </body>
-                    </html>
-                    """
-                    components.html(html, height=700)
-            with col_pdf:
-                if FPDF_AVAILABLE:
-                    pdf_bytes = build_ledger_pdf(ledger_rows, selected_vendor, from_date, to_date)
-                    st.download_button(
-                        "Download PDF",
-                        data=pdf_bytes,
-                        file_name=f"ledger_{selected_vendor}_{from_date}_to_{to_date}.pdf",
-                        mime="application/pdf",
-                    )
-                else:
-                    st.info("Install fpdf2 to enable PDF export.")
-        else:
-            st.info("No ledger entries are available for this vendor for the selected date range.")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# 6. REPORTS
-elif selected_page == "Reports":
-    st.subheader("📈 Reports")
-    st.caption("Review financial reports and vendor performance across the ERP.")
-
-    total_vendors = len(vendor_catalog)
-    invoice_count = len(df_inward)
-    payment_count = len(df_payments)
-    avg_payment = df_payments["Amount Paid (PKR)"].mean() if not df_payments.empty else 0.0
-
-    st.markdown("<div class='kpi-group'>", unsafe_allow_html=True)
-    st.markdown(f"<div class='kpi-card'><h3>Total Vendors</h3><p class='kpi-value'>{total_vendors}</p></div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='kpi-card'><h3>Total Invoices</h3><p class='kpi-value'>{invoice_count}</p></div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='kpi-card'><h3>Average Payment</h3><p class='kpi-value'>PKR {avg_payment:,.2f}</p></div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='panel-content'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>Vendor Balances Report</div>", unsafe_allow_html=True)
-    balances = []
-    for vendor in sorted(vendor_catalog.keys()):
-        v_total = df_inward[df_inward["Vendor"] == vendor]["Total Amount (PKR)"].sum() if not df_inward.empty else 0.0
-        v_paid = df_payments[df_payments["Vendor"] == vendor]["Amount Paid (PKR)"].sum() if not df_payments.empty else 0.0
-        balances.append({
-            "Vendor": vendor,
-            "Total Billed": v_total,
-            "Total Paid": v_paid,
-            "Balance": v_total - v_paid,
-        })
-    render_controlled_table(pd.DataFrame(balances).sort_values("Balance", ascending=False), show_index=False)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='panel-content'>", unsafe_allow_html=True)
-    st.markdown("<div class='panel-title'>Import Transactions (JSON Backup)</div>", unsafe_allow_html=True)
-    uploaded = st.file_uploader("Upload JSON backup file", type=["json"], help="Upload an array of transaction objects with keys: date, description, amount, category")
-    if uploaded is not None:
-        with st.spinner("Importing transactions..."):
-            ok, msg = import_transactions_from_json(uploaded)
-        if ok:
-            st.success(msg)
-        else:
-            st.error(msg)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# 5. VENDOR DIRECTORY
-elif selected_page == "Vendor Directory":
-    st.subheader("👥 Vendor Management")
-    col_v1, col_v2 = st.columns([2, 1])
-
-    vendor_status = st.session_state.pop("vendor_submit_status", None)
-    if isinstance(vendor_status, dict):
-        status_kind = str(vendor_status.get("kind", "")).lower()
-        status_message = str(vendor_status.get("message", "")).strip()
-        if status_message:
-            if status_kind == "success":
-                st.success(status_message)
-            elif status_kind == "warning":
-                st.warning(status_message)
-            else:
-                st.error(status_message)
-    
-    with col_v1:
-        st.markdown("### 📋 All Vendors List")
-        vendors_summary = [{"Vendor Name": v_name, "Total Items Registered": len(items)} for v_name, items in vendor_catalog.items()]
-        render_controlled_table(pd.DataFrame(vendors_summary), show_index=False)
-
-    with col_v2:
-        st.markdown("### ➕ Add New Vendor")
-        with st.form("add_vendor_form", clear_on_submit=True):
-            new_v = st.text_input("Enter Vendor Name:")
-            new_contact = st.text_input("Contact")
-            new_address = st.text_area("Address", height=90)
-            add_v_btn = st.form_submit_button("Add Vendor")
-            if add_v_btn:
-                vendor_name = new_v.strip()
-                if not vendor_name:
-                    st.error("Vendor name is required.")
-                elif vendor_name in vendor_catalog:
-                    st.warning(f"Vendor '{vendor_name}' already exists.")
-                else:
-                    vendor_catalog[vendor_name] = {}
-                    try:
-                        save_vendor_to_google_sheets_strict(vendor_catalog, vendor_name, new_contact, new_address)
-                        st.session_state["vendor_submit_status"] = {
-                            "kind": "success",
-                            "message": f"Vendor '{vendor_name}' added successfully and synced to Google Sheets.",
-                        }
-                    except Exception as exc:
-                        save_vendor_catalog(vendor_catalog)
-                        st.session_state["vendor_submit_status"] = {
-                            "kind": "warning",
-                            "message": f"Vendor '{vendor_name}' saved locally; Google Sheets sync failed ({exc}).",
-                        }
-                    _refresh_app_data_after_submit()
-
-# 5. ITEMS CATALOG
-elif selected_page == "Items Catalog":
-    st.subheader("📦 Vendor Items & Rates Catalog")
-    col_i1, col_i2 = st.columns([2, 1])
-    
-    with col_i1:
-        filter_vendor = st.selectbox("Filter Items by Vendor:", ["All Vendors"] + list(vendor_catalog.keys()))
-        items_data = []
-        for v_name, items in vendor_catalog.items():
-            if filter_vendor == "All Vendors" or filter_vendor == v_name:
-                for item_name, item_rate in items.items():
-                    items_data.append({"Vendor": v_name, "Item Name": item_name, "Rate (PKR)": item_rate})
-        render_controlled_table(pd.DataFrame(items_data), show_index=False)
-
-    with col_i2:
-        st.markdown("### ➕ Add New Item / Rate")
-        with st.form("add_item_form", clear_on_submit=True):
-            target_v = st.selectbox("Select Vendor:", list(vendor_catalog.keys()))
-            item_n = st.text_input("Item Name:")
-            item_r = st.number_input("Rate (PKR):", min_value=0.0, step=5.0)
-            add_i_btn = st.form_submit_button("Add Item")
-            if add_i_btn and item_n:
-                vendor_catalog[target_v][item_n] = item_r
-                save_vendor_catalog(vendor_catalog)
-                st.session_state["vendor_submit_status"] = {
-                    "kind": "success",
-                    "message": f"Item '{item_n}' added successfully for vendor '{target_v}'.",
+    st.markdown("### Recent Goods Receipts")
+    if receipts:
+        st.dataframe(
+            [
+                {
+                    "receipt_number": row["receipt_number"],
+                    "receipt_date": row["receipt_date"],
+                    "vendor_name": row["vendor_name"],
+                    "item_name": row["item_name"],
+                    "quantity": row["quantity"],
+                    "unit_cost": row["unit_cost"],
                 }
-                _refresh_app_data_after_submit()
+                for row in receipts[:8]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption(f"No receipts recorded yet. Inventory value: ${stock_value:,.2f}")
+
+
+def render_vendors(client: SupabaseClient) -> None:
+    render_section_intro("vendors")
+    with st.form("vendor_form", clear_on_submit=True):
+        st.markdown("### Add Approved Vendor")
+        col1, col2 = st.columns(2)
+        next_vendor_code = generate_vendor_code(client)
+        col1.text_input("Vendor Code", value=next_vendor_code, disabled=True)
+        vendor_name = col2.text_input("Vendor Name")
+        contact_person = col1.text_input("Contact Person")
+        email = col2.text_input("Email")
+        phone = col1.text_input("Phone")
+        submitted = st.form_submit_button("Save Vendor")
+
+    if submitted:
+        if not vendor_name.strip():
+            st.error("Vendor name is required.")
+        else:
+            try:
+                code = create_vendor(client, vendor_name, contact_person, email, phone)
+                st.success(f"Vendor saved with code {code}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Vendor could not be saved: {exc}")
+
+    vendor_rows = fetch_vendors(client)
+    st.markdown("### Approved Vendor Directory")
+    st.dataframe(vendor_rows, use_container_width=True, hide_index=True)
+
+    if vendor_rows:
+        st.markdown("### Edit or Delete Vendor")
+        options = {row["id"]: f"{row['vendor_code']} | {row['vendor_name']}" for row in vendor_rows}
+        selected_id = st.selectbox("Select Vendor", options=list(options.keys()), format_func=lambda rid: options[rid])
+        selected = find_row_by_id(vendor_rows, selected_id)
+        if not selected:
+            return
+
+        with st.form("vendor_edit_form"):
+            col1, col2 = st.columns(2)
+            edit_vendor_code = col1.text_input("Vendor Code", value=selected["vendor_code"], key=f"vendor_code_{selected_id}")
+            edit_vendor_name = col2.text_input("Vendor Name", value=selected["vendor_name"], key=f"vendor_name_{selected_id}")
+            edit_contact_person = col1.text_input("Contact Person", value=selected.get("contact_person") or "", key=f"vendor_contact_{selected_id}")
+            edit_email = col2.text_input("Email", value=selected.get("email") or "", key=f"vendor_email_{selected_id}")
+            edit_phone = col1.text_input("Phone", value=selected.get("phone") or "", key=f"vendor_phone_{selected_id}")
+            updated = st.form_submit_button("Update Vendor")
+
+        if updated:
+            try:
+                update_vendor(
+                    client,
+                    selected_id,
+                    {
+                        "vendor_code": edit_vendor_code.strip().upper(),
+                        "vendor_name": edit_vendor_name.strip(),
+                        "contact_person": edit_contact_person.strip(),
+                        "email": edit_email.strip(),
+                        "phone": edit_phone.strip(),
+                    },
+                )
+                st.success("Vendor updated.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Vendor update failed: {exc}")
+
+        if render_delete_confirmation("confirm_delete_vendor", selected_id, selected["vendor_name"]):
+            try:
+                delete_vendor(client, selected_id)
+                st.success("Vendor deleted.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Vendor cannot be deleted: {exc}")
+
+
+def render_items(client: SupabaseClient) -> None:
+    render_section_intro("items")
+    vendors = fetch_vendors(client)
+    vendor_options = {vendor["vendor_name"]: vendor["id"] for vendor in vendors}
+
+    with st.form("item_form", clear_on_submit=True):
+        st.markdown("### Register Material or Finished SKU")
+        col1, col2 = st.columns(2)
+        next_sku = generate_sku(client)
+        col1.text_input("SKU", value=next_sku, disabled=True)
+        item_name = col2.text_input("Item Name")
+        unit = col1.selectbox("Unit", ["pcs", "box", "kg", "ltr", "set"])
+        unit_price = col2.number_input("Unit Price", min_value=0.0, step=0.5)
+        stock_on_hand = col1.number_input("Opening Stock", min_value=0.0, step=1.0)
+        vendor_name = col2.selectbox("Preferred Vendor", options=["Unassigned", *vendor_options.keys()])
+        submitted = st.form_submit_button("Save Item")
+
+    if submitted:
+        if not item_name.strip():
+            st.error("Item name is required.")
+        else:
+            try:
+                sku = create_item(
+                    client,
+                    item_name,
+                    unit,
+                    float(unit_price),
+                    float(stock_on_hand),
+                    vendor_options.get(vendor_name),
+                )
+                st.success(f"Item saved with SKU {sku}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Item could not be saved: {exc}")
+
+    item_rows = fetch_items(client)
+    st.markdown("### Item Master")
+    st.dataframe(item_rows, use_container_width=True, hide_index=True)
+
+    if item_rows:
+        st.markdown("### Edit or Delete Item")
+        item_options = {row["id"]: f"{row['sku']} | {row['item_name']}" for row in item_rows}
+        selected_id = st.selectbox("Select Item", options=list(item_options.keys()), format_func=lambda rid: item_options[rid])
+        selected = find_row_by_id(item_rows, selected_id)
+        if not selected:
+            return
+
+        edit_vendor_names = ["Unassigned", *vendor_options.keys()]
+        current_vendor_name = selected.get("vendor_name") or "Unassigned"
+        vendor_index = edit_vendor_names.index(current_vendor_name) if current_vendor_name in edit_vendor_names else 0
+        unit_options = ["pcs", "box", "kg", "ltr", "set"]
+
+        with st.form("item_edit_form"):
+            col1, col2 = st.columns(2)
+            edit_sku = col1.text_input("SKU", value=selected["sku"], key=f"item_sku_{selected_id}")
+            edit_item_name = col2.text_input("Item Name", value=selected["item_name"], key=f"item_name_{selected_id}")
+            edit_unit = col1.selectbox("Unit", options=unit_options, index=unit_options.index(selected["unit"]) if selected["unit"] in unit_options else 0, key=f"item_unit_{selected_id}")
+            edit_unit_price = col2.number_input("Unit Price", min_value=0.0, step=0.5, value=float(selected["unit_price"]), key=f"item_price_{selected_id}")
+            edit_stock_on_hand = col1.number_input("Stock On Hand", min_value=0.0, step=1.0, value=float(selected["stock_on_hand"]), key=f"item_stock_{selected_id}")
+            edit_vendor_name = col2.selectbox("Preferred Vendor", options=edit_vendor_names, index=vendor_index, key=f"item_vendor_{selected_id}")
+            updated = st.form_submit_button("Update Item")
+
+        if updated:
+            if not edit_sku.strip() or not edit_item_name.strip():
+                st.error("SKU and item name are required.")
+                return
+            try:
+                update_item(
+                    client,
+                    selected_id,
+                    {
+                        "sku": edit_sku.strip().upper(),
+                        "item_name": edit_item_name.strip(),
+                        "unit": edit_unit,
+                        "unit_price": float(edit_unit_price),
+                        "stock_on_hand": float(edit_stock_on_hand),
+                        "vendor_id": vendor_options.get(edit_vendor_name),
+                    },
+                )
+                st.success("Item updated.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Item update failed: {exc}")
+
+        if render_delete_confirmation("confirm_delete_item", selected_id, selected["item_name"]):
+            try:
+                delete_item(client, selected_id)
+                st.success("Item deleted.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Item cannot be deleted: {exc}")
+
+    st.caption("Vendor-item-rate mappings are managed automatically from Item Master using Preferred Vendor and Unit Price.")
+
+
+def render_receipts(client: SupabaseClient) -> None:
+    render_section_intro("receipts")
+    vendors = fetch_vendors(client)
+
+    if not vendors:
+        st.warning("Create at least one vendor before posting inward entries.")
+        return
+
+    vendor_options = {vendor["vendor_name"]: vendor["id"] for vendor in vendors}
+    st.markdown("### Simplified Inward Entry")
+    st.caption("Only date, vendor, mapped item/stage, and quantity are required.")
+
+    selected_vendor_name = st.selectbox(
+        "Vendor Name",
+        options=list(vendor_options.keys()),
+        key="inward_vendor_name",
+    )
+    selected_vendor_id = vendor_options[selected_vendor_name]
+    vendor_mappings = fetch_vendor_item_rates_for_vendor_name(client, selected_vendor_name)
+    mapping_rows_by_id = {int(row["id"]): row for row in vendor_mappings}
+    mapping_option_ids = list(mapping_rows_by_id.keys())
+
+    with st.form("receipt_form", clear_on_submit=True):
+        inward_date = st.date_input("Date", value=date.today())
+
+        if mapping_option_ids:
+            selected_mapping_id = st.selectbox(
+                "Auto-loaded Vendor Items / Stages",
+                options=mapping_option_ids,
+                format_func=lambda mapping_id: mapping_rows_by_id[mapping_id]["item_label"],
+                key=f"inward_vendor_item_{selected_vendor_id}",
+                help="Loaded strictly from the selected vendor's permanent Vendor-Item-Rate mapping.",
+            )
+        else:
+            st.warning("No items or stages are assigned to this vendor yet. Map items first.")
+            st.selectbox(
+                "Auto-loaded Vendor Items / Stages",
+                options=[""],
+                format_func=lambda _: "No mapped items for selected vendor",
+                disabled=True,
+            )
+            selected_mapping_id = None
+
+        quantity = st.number_input("Quantity", min_value=0.01, step=1.0)
+        submitted = st.form_submit_button("Save Inward Entry")
+
+    if submitted:
+        if not mapping_option_ids or selected_mapping_id is None:
+            st.error("No permanent vendor-item-rate mapping found. Configure it in Item Register first.")
+            return
+        try:
+            selected_mapping = mapping_rows_by_id[selected_mapping_id]
+            selected_item_id = int(selected_mapping["item_id"])
+            selected_item_label = str(selected_mapping.get("item_label") or "Mapped Item")
+            auto_unit_rate = float(selected_mapping.get("unit_rate") or 0.0)
+            auto_total_amount = float(quantity) * auto_unit_rate
+            receipt_number = f"RCV-{datetime.now():%Y%m%d-%H%M%S}"
+            create_receipt(
+                client,
+                receipt_number,
+                inward_date,
+                selected_vendor_id,
+                selected_item_id,
+                float(quantity),
+                auto_unit_rate,
+                st.session_state["user"]["full_name"],
+                f"Auto-calculated total amount: {auto_total_amount:.2f}",
+            )
+
+            # Auto-create inward lot in simplified mode so lot traceability remains.
+            lot_number = f"LOT-{datetime.now():%Y%m%d-%H%M%S}"
+            create_inward_lot(
+                client,
+                {
+                    "lot_number": lot_number,
+                    "receipt_id": fetch_receipts(client)[0]["id"],
+                    "vendor_id": selected_vendor_id,
+                    "item_id": selected_item_id,
+                    "quantity_received": float(quantity),
+                    "manufacturing_date": inward_date.isoformat(),
+                    "expiry_date": inward_date.isoformat(),
+                    "qc_status": "Pending QC",
+                    "warehouse_bin": "",
+                    "notes": "Auto-generated from simplified inward entry",
+                    "created_by": st.session_state["user"]["full_name"],
+                },
+            )
+
+            create_payment_slip(
+                client,
+                {
+                    "voucher_number": generate_payment_slip_number(client),
+                    "voucher_date": inward_date.isoformat(),
+                    "vendor_id": selected_vendor_id,
+                    "amount": auto_total_amount,
+                    PAYMENT_SLIP_TYPE_COLUMN: "Vendor",
+                    "tracking_number": receipt_number,
+                    "tracking_status": "Generated from Inward",
+                    "vendor_signature_name": "",
+                    "vendor_signature_date": inward_date.isoformat(),
+                    "operation_notes": f"Auto-generated from inward: {selected_item_label} x {float(quantity):.2f}",
+                    "approved_by": st.session_state["user"]["full_name"],
+                    "remarks": f"PAYEE: {selected_vendor_name}",
+                },
+            )
+
+            st.session_state["last_inward_slip"] = {
+                "lot_number": lot_number,
+                "date": inward_date.isoformat(),
+                "vendor_name": selected_vendor_name,
+                "item": selected_item_label,
+                "quantity": float(quantity),
+                "rate": auto_unit_rate,
+                "calculated_amount": auto_total_amount,
+            }
+
+            st.success("Inward entry saved. Total cost was calculated in the background and a Payment Slip was generated.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Receipt could not be posted: {exc}")
+
+    last_inward_slip = st.session_state.get("last_inward_slip")
+    if isinstance(last_inward_slip, dict) and last_inward_slip:
+        st.markdown("---")
+        st.markdown("### Inward Slip")
+        st.caption("Download the official inward receipt slip for the latest saved inward entry.")
+        try:
+            slip_pdf = generate_inward_slip_pdf(last_inward_slip)
+            st.download_button(
+                label="Download Inward Slip PDF",
+                data=slip_pdf,
+                file_name=f"Inward_Slip_{last_inward_slip.get('lot_number', 'latest')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="download_last_inward_slip_pdf",
+            )
+        except Exception as exc:
+            st.warning("Inward slip PDF export is currently unavailable. Please verify ReportLab is installed and try again.")
+            with st.expander("Technical details"):
+                st.code(str(exc))
+
+
+def render_payment_slips(client: SupabaseClient) -> None:
+    render_section_intro("payment_slips")
+    vendors = fetch_vendors(client)
+    vendor_options = {vendor["vendor_name"]: vendor["id"] for vendor in vendors}
+
+    with st.form("simple_payment_slip_form", clear_on_submit=True):
+        st.markdown("### Record Payment Slip")
+        col1, col2, col3 = st.columns(3)
+        col1.text_input("Slip Number", value=generate_payment_slip_number(client), disabled=True)
+        slip_date = col2.date_input("Date", value=date.today(), key="simple_slip_date")
+        payee_type = col3.selectbox("Payee Type", options=["Vendor", "Worker"])
+
+        if payee_type == "Vendor":
+            if not vendor_options:
+                st.selectbox("Vendor Name", options=["No vendors available"], disabled=True)
+                vendor_name = ""
+            else:
+                vendor_name = st.selectbox("Vendor Name", options=list(vendor_options.keys()))
+            payee_name = vendor_name
+            vendor_id = vendor_options.get(vendor_name)
+        else:
+            payee_name = st.text_input("Worker / Payee Name", placeholder="e.g., Imran Polishia")
+            vendor_id = None
+
+        amount = st.number_input("Cash Amount", min_value=0.01, step=1.0, key="simple_slip_amount")
+        description = st.text_area("Description", placeholder="Reason/purpose of this payment")
+        signature_name = st.text_input("Signature")
+        signature_date = st.date_input("Signature Date", value=date.today(), key="simple_signature_date")
+        submitted = st.form_submit_button("Save Payment Slip")
+
+    if submitted:
+        if not payee_name.strip():
+            st.error("Payee name is required.")
+            return
+        try:
+            create_payment_slip(
+                client,
+                {
+                    "voucher_number": generate_payment_slip_number(client),
+                    "voucher_date": slip_date.isoformat(),
+                    "vendor_id": vendor_id,
+                    "amount": float(amount),
+                    PAYMENT_SLIP_TYPE_COLUMN: payee_type,
+                    "tracking_number": "",
+                    "tracking_status": "Recorded",
+                    "vendor_signature_name": signature_name.strip(),
+                    "vendor_signature_date": signature_date.isoformat(),
+                    "operation_notes": description.strip(),
+                    "approved_by": st.session_state["user"]["full_name"],
+                    "remarks": f"PAYEE: {payee_name.strip()}",
+                },
+            )
+            st.success("Payment slip saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Payment slip could not be saved: {exc}")
+
+    vouchers = fetch_payment_slips(client)
+    st.markdown("### Payment Slip Register")
+    st.dataframe(
+        [
+            {
+                "slip_number": row.get("voucher_number"),
+                "date": row.get("voucher_date"),
+                "payee_type": row.get("payee_type"),
+                "payee_name": row.get("payee_name"),
+                "cash_amount": row.get("amount"),
+                "description": row.get("description"),
+                "signature": row.get("vendor_signature_name"),
+                "signature_date": row.get("vendor_signature_date"),
+            }
+            for row in vouchers
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if vouchers:
+        st.markdown("### Edit or Delete Payment Slip")
+        options = {
+            row["id"]: f"{row['voucher_number']} | {row.get('payee_name', 'Unknown')} | {float(row['amount']):.2f}"
+            for row in vouchers
+        }
+        selected_id = st.selectbox(
+            "Select Payment Slip",
+            options=list(options.keys()),
+            format_func=lambda rid: options[rid],
+        )
+        selected = find_row_by_id(vouchers, selected_id)
+        if not selected:
+            return
+
+        vendor_names = list(vendor_options.keys())
+        initial_payee_type = "Vendor" if selected.get("vendor_id") else "Worker"
+        initial_payee_name = selected.get("payee_name") or ""
+        with st.form("simple_payment_slip_edit_form"):
+            col1, col2, col3 = st.columns(3)
+            edit_slip_number = col1.text_input(
+                "Slip Number",
+                value=selected["voucher_number"],
+                key=f"simple_slip_num_{selected_id}",
+            )
+            edit_slip_date = col2.date_input(
+                "Date",
+                value=parse_iso_date(selected.get("voucher_date")),
+                key=f"simple_slip_date_{selected_id}",
+            )
+            edit_payee_type = col3.selectbox(
+                "Payee Type",
+                options=["Vendor", "Worker"],
+                index=0 if initial_payee_type == "Vendor" else 1,
+                key=f"simple_payee_type_{selected_id}",
+            )
+
+            if edit_payee_type == "Vendor":
+                if vendor_names:
+                    current_vendor_name = selected.get("vendor_name") if selected.get("vendor_name") in vendor_names else vendor_names[0]
+                    edit_vendor_name = st.selectbox(
+                        "Vendor Name",
+                        options=vendor_names,
+                        index=vendor_names.index(current_vendor_name),
+                        key=f"simple_vendor_{selected_id}",
+                    )
+                    edit_payee_name = edit_vendor_name
+                    edit_vendor_id = vendor_options[edit_vendor_name]
+                else:
+                    st.selectbox("Vendor Name", options=["No vendors available"], disabled=True)
+                    edit_payee_name = ""
+                    edit_vendor_id = None
+            else:
+                edit_payee_name = st.text_input(
+                    "Worker / Payee Name",
+                    value=initial_payee_name,
+                    key=f"simple_worker_{selected_id}",
+                )
+                edit_vendor_id = None
+
+            edit_amount = st.number_input(
+                "Cash Amount",
+                min_value=0.01,
+                step=1.0,
+                value=float(selected.get("amount") or 0.0),
+                key=f"simple_slip_amount_{selected_id}",
+            )
+            edit_description = st.text_area(
+                "Description",
+                value=selected.get("description") or "",
+                key=f"simple_description_{selected_id}",
+            )
+            edit_signature_name = st.text_input(
+                "Signature",
+                value=selected.get("vendor_signature_name") or "",
+                key=f"simple_signature_name_{selected_id}",
+            )
+            edit_signature_date = st.date_input(
+                "Signature Date",
+                value=parse_iso_date(selected.get("vendor_signature_date")),
+                key=f"simple_signature_date_{selected_id}",
+            )
+            updated = st.form_submit_button("Update Payment Slip")
+
+        if updated:
+            if not edit_payee_name.strip():
+                st.error("Payee name is required.")
+                return
+            try:
+                update_payment_slip(
+                    client,
+                    selected_id,
+                    {
+                        "voucher_number": edit_slip_number.strip().upper(),
+                        "voucher_date": edit_slip_date.isoformat(),
+                        "vendor_id": edit_vendor_id,
+                        "amount": float(edit_amount),
+                        PAYMENT_SLIP_TYPE_COLUMN: edit_payee_type,
+                        "tracking_number": "",
+                        "tracking_status": "Recorded",
+                        "vendor_signature_name": edit_signature_name.strip(),
+                        "vendor_signature_date": edit_signature_date.isoformat(),
+                        "operation_notes": edit_description.strip(),
+                        "remarks": f"PAYEE: {edit_payee_name.strip()}",
+                    },
+                )
+                st.success("Payment slip updated.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Payment slip update failed: {exc}")
+
+        if render_delete_confirmation("confirm_delete_payment_slip", selected_id, selected["voucher_number"]):
+            try:
+                delete_payment_slip(client, selected_id)
+                st.success("Payment slip deleted.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Payment slip delete failed: {exc}")
+
+
+def render_inward_summary(client: SupabaseClient) -> None:
+    render_section_intro("inward_summary")
+    summary_rows = fetch_inward_summary_rows(client)
+    receipts = fetch_receipts(client)
+
+    total_quantity = sum(float(row.get("total_quantity") or 0.0) for row in summary_rows)
+    total_amount = sum(float(row.get("total_amount") or 0.0) for row in summary_rows)
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Inward Entries", str(len(receipts)))
+    metric2.metric("Total Quantity", f"{total_quantity:,.2f}")
+    metric3.metric("Total Amount", format_pkr(total_amount))
+
+    if summary_rows:
+        st.dataframe(summary_rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No inward entries recorded yet.")
+
+
+def render_vendor_ledger(client: SupabaseClient) -> None:
+    render_section_intro("vendor_ledger")
+    vendors = fetch_vendors(client)
+    if not vendors:
+        st.caption("No vendors available yet.")
+        return
+
+    st.markdown(
+        """
+        <style>
+            .main-title { font-size: 26px; font-weight: 700; color: #1E3A8A; margin-bottom: 5px; }
+            .sub-title { font-size: 16px; font-weight: 600; color: #4B5563; margin-bottom: 15px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="main-title">Prexa Industries - Vendor Ledger & Statement</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">Surgical Manufacturing & Export Operations ERP</div>', unsafe_allow_html=True)
+    st.markdown('<div class="ledger-header">Vendor inward lots and payment slips are combined into one running vendor balance.</div>', unsafe_allow_html=True)
+
+    vendor_options = {vendor["vendor_name"]: vendor["id"] for vendor in vendors}
+    col1, col2, col3 = st.columns(3)
+    selected_vendor_name = col1.selectbox("Select Vendor", options=list(vendor_options.keys()), key="ledger_vendor_name")
+    start_date = col2.date_input("Start Date", value=date.today().replace(day=1), key="ledger_start_date")
+    end_date = col3.date_input("End Date", value=date.today(), key="ledger_end_date")
+    selected_vendor_id = vendor_options[selected_vendor_name]
+
+    ledger_rows = [
+        row
+        for row in fetch_vendor_ledger_rows(client)
+        if row.get("vendor_id") == selected_vendor_id
+        or str(row.get("payee_name") or "").strip().casefold() == selected_vendor_name.casefold()
+    ]
+    ledger_rows = [
+        row
+        for row in ledger_rows
+        if start_date <= parse_row_date(row.get("date")) <= end_date
+    ]
+
+    if ledger_rows:
+        ledger_rows.sort(key=lambda row: (row.get("date") or "", row.get("sort_id") or 0))
+
+    # Recompute vendor-specific running balance on the filtered sequence,
+    # equivalent to: sort by date ascending -> cumulative sum of signed amounts.
+    running_balance = 0.0
+    for row in ledger_rows:
+        running_balance += float(row.get("amount") or 0.0)
+        row["running_balance"] = running_balance
+
+    total_quantity = sum(float(row.get("quantity") or 0.0) for row in ledger_rows if row.get("entry_type") == "Inward Lot")
+    total_inward_amount = sum(float(row.get("amount") or 0.0) for row in ledger_rows if row.get("entry_type") == "Inward Lot")
+    total_payment_amount = sum(abs(float(row.get("amount") or 0.0)) for row in ledger_rows if row.get("entry_type") == "Payment")
+    accumulated_balance = float(ledger_rows[-1].get("running_balance") or 0.0) if ledger_rows else 0.0
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Accumulated Quantity", f"{total_quantity:,.2f}")
+    metric2.metric("Total Inward", format_pkr(total_inward_amount))
+    metric3.metric("Accumulated Balance", format_pkr(accumulated_balance))
+
+    st.caption(f"Payments posted for this vendor: {format_pkr(total_payment_amount)}")
+
+    if ledger_rows:
+        try:
+            opening_balance = float(ledger_rows[0].get("running_balance") or 0.0) - float(ledger_rows[0].get("amount") or 0.0)
+            pdf_file = generate_vendor_statement_pdf(
+                selected_vendor_name,
+                start_date,
+                end_date,
+                ledger_rows,
+                opening_balance,
+                accumulated_balance,
+            )
+            st.download_button(
+                label="Download HD PDF Report",
+                data=pdf_file,
+                file_name=f"{selected_vendor_name}_Ledger_Report.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.info(f"PDF export is unavailable in this environment: {exc}")
+
+        st.dataframe(
+            [
+                {
+                    "date": row.get("date"),
+                    "type": row.get("entry_type"),
+                    "item_or_description": row.get("item_name"),
+                    "reference": row.get("reference_number"),
+                    "quantity": row.get("quantity"),
+                    "amount": row.get("amount"),
+                    "running_balance": row.get("running_balance"),
+                }
+                for row in ledger_rows
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No inward lots or payment slips recorded yet for this vendor.")
+
+
+def render_users(client: SupabaseClient) -> None:
+    render_section_intro("users")
+    st.caption("Admins can create login users here.")
+    with st.form("user_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        username = col1.text_input("Username")
+        full_name = col2.text_input("Full Name")
+        role = col1.selectbox("Role", options=list(ROLE_PERMISSIONS.keys()))
+        password = col2.text_input("Temporary Password", type="password")
+        submitted = st.form_submit_button("Create User")
+
+    if submitted:
+        if not username.strip() or not full_name.strip() or not password:
+            st.error("Username, full name, and temporary password are required.")
+        else:
+            try:
+                create_user(client, username, full_name, role, password)
+                st.success("User created.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"User could not be created: {exc}")
+
+    st.dataframe(fetch_users(client), use_container_width=True, hide_index=True)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Prexa Industries ERP", page_icon="🏭", layout="wide")
+    inject_styles()
+    ensure_session_state()
+
+    st.markdown(
+        """
+        <div class="hero-card">
+            <div class="hero-eyebrow">Prexa Industries</div>
+            <div class="hero-title">Surgical Manufacturing & Export Operations ERP</div>
+            <p class="hero-copy">Supabase cloud data backend with role-based operational workflows.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    client, _connection_status = get_supabase_client()
+
+    ready, status_message = initialize_data_layer(client)
+    if not ready:
+        st.error(status_message)
+        return
+
+    if not st.session_state["user"]:
+        render_login(client)
+        return
+
+    available_sections = [
+        section
+        for section in [
+            "dashboard",
+            "vendors",
+            "items",
+            "receipts",
+            "inward_summary",
+            "vendor_ledger",
+            "payment_slips",
+            "users",
+        ]
+        if require_role(section)
+    ]
+    section = render_sidebar_navigation(available_sections)
+
+    if section == "dashboard":
+        render_dashboard(client)
+    elif section == "vendors":
+        render_vendors(client)
+    elif section == "items":
+        render_items(client)
+    elif section == "receipts":
+        render_receipts(client)
+    elif section == "inward_summary":
+        render_inward_summary(client)
+    elif section == "vendor_ledger":
+        render_vendor_ledger(client)
+    elif section == "payment_slips":
+        render_payment_slips(client)
+    elif section == "users":
+        render_users(client)
+
+
+if __name__ == "__main__":
+    main()
