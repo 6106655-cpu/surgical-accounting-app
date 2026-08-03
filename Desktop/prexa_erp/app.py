@@ -94,7 +94,7 @@ SEED_USERS = [
     ("buyer", "Procurement Lead", "procurement", "buyer123"),
     ("clerk", "Warehouse Clerk", "warehouse", "clerk123"),
     ("viewer", "Finance Viewer", "viewer", "viewer123"),
-    ("store_ops", "Store Operations", "store_ops", "store123"),
+    ("store_ops", "Store Operations", "store_ops", "office123"),
 ]
 
 RETIRED_USERNAMES = ["store_worker"]
@@ -1398,6 +1398,7 @@ def fetch_vendor_ledger_rows(client: SupabaseClient) -> list[dict[str, Any]]:
                 "reference_number": slip.get("voucher_number"),
                 "quantity": 0.0,
                 "unit_rate": 0.0,
+
                 "amount": amount,
                 "sort_id": int(slip.get("id") or 0),
                 "payee_name": payee_name,
