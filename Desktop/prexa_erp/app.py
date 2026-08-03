@@ -86,7 +86,7 @@ ROLE_PERMISSIONS = {
     },
     "warehouse": {"dashboard", "items", "receipts", "inward_summary", "vendor_ledger"},
     "viewer": {"dashboard", "inward_summary", "vendor_ledger", "payment_slips"},
-    "store_worker": {"receipts", "inward_summary"},
+    "store_ops": {"receipts", "inward_summary"},
 }
 
 SEED_USERS = [
@@ -94,8 +94,10 @@ SEED_USERS = [
     ("buyer", "Procurement Lead", "procurement", "buyer123"),
     ("clerk", "Warehouse Clerk", "warehouse", "clerk123"),
     ("viewer", "Finance Viewer", "viewer", "viewer123"),
-    ("store_worker", "Store Worker", "store_worker", "store123"),
+    ("store_ops", "Store Operations", "store_ops", "StoreOps@2026"),
 ]
+
+RETIRED_USERNAMES = ["store_worker"]
 
 REQUIRED_TABLES = [
     "users",
@@ -510,6 +512,13 @@ def check_supabase_schema(client: SupabaseClient) -> tuple[bool, str]:
 
 
 def seed_users(client: SupabaseClient) -> None:
+    for retired_username in RETIRED_USERNAMES:
+        try:
+            client.table("users").delete().eq("username", retired_username).execute()
+        except Exception:
+            # Ignore permission issues in restricted hosted setups.
+            pass
+
     payload = [
         {
             "username": username,
