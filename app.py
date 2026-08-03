@@ -689,7 +689,10 @@ def generate_inward_slip_pdf(inward_data: dict[str, Any]) -> io.BytesIO:
     from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     def generate_qr_code(data: str) -> io.BytesIO:
-        import qrcode
+        try:
+            import qrcode
+        except Exception as exc:
+            raise RuntimeError("qrcode package is not installed. Add qrcode[pil] to requirements.txt.") from exc
 
         qr_img = qrcode.make(data)
         qr_buffer = io.BytesIO()
