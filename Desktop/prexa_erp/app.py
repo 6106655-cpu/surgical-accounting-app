@@ -117,6 +117,7 @@ PAYMENT_SLIP_TYPE_COLUMN = "packing_reference"
 APP_ROOT = Path(__file__).resolve().parent
 LOCAL_DB_PATH = APP_ROOT / "prexa_erp.db"
 LEGACY_LOCAL_DB_PATH = APP_ROOT / "prexa_erp_local.db"
+LOCAL_SCHEMA_REBUILD_TOKEN = "2026-08-03-live-rebuild-1"
 
 LOCAL_TABLE_SCHEMAS: dict[str, str] = {
     "users": """
@@ -451,6 +452,7 @@ class LocalClient:
     def __init__(self) -> None:
         self.db_path = LOCAL_DB_PATH
         self._migrate_legacy_db_if_needed()
+        self._rebuild_schema_if_needed()
         self._ensure_schema()
 
     def table(self, table_name: str) -> LocalQuery:
@@ -468,6 +470,40 @@ class LocalClient:
         # One-time safety migration so existing local data is retained.
         if not self.db_path.exists() and LEGACY_LOCAL_DB_PATH.exists():
             shutil.copy2(LEGACY_LOCAL_DB_PATH, self.db_path)
+
+    def _rebuild_schema_if_needed(self) -> None:
+        with self.get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            current_row = conn.execute(
+                "SELECT value FROM app_meta WHERE key = ? LIMIT 1",
+                ("local_schema_rebuild_token",),
+            ).fetchone()
+            current_token = str(current_row["value"]) if current_row else ""
+            if current_token == LOCAL_SCHEMA_REBUILD_TOKEN:
+                return
+
+            conn.execute("PRAGMA foreign_keys=OFF")
+            for table_name in REQUIRED_TABLES:
+                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+            for ddl in LOCAL_TABLE_SCHEMAS.values():
+                conn.execute(ddl)
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute(
+                """
+                INSERT INTO app_meta (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                ("local_schema_rebuild_token", LOCAL_SCHEMA_REBUILD_TOKEN),
+            )
+            conn.commit()
 
     def get_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.db_path), timeout=30)
