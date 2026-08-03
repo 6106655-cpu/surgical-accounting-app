@@ -86,6 +86,7 @@ ROLE_PERMISSIONS = {
     },
     "warehouse": {"dashboard", "items", "receipts", "inward_summary", "vendor_ledger"},
     "viewer": {"dashboard", "inward_summary", "vendor_ledger", "payment_slips"},
+    "store_worker": {"receipts", "inward_summary"},
 }
 
 SEED_USERS = [
@@ -93,6 +94,7 @@ SEED_USERS = [
     ("buyer", "Procurement Lead", "procurement", "buyer123"),
     ("clerk", "Warehouse Clerk", "warehouse", "clerk123"),
     ("viewer", "Finance Viewer", "viewer", "viewer123"),
+    ("store_worker", "Store Worker", "store_worker", "store123"),
 ]
 
 REQUIRED_TABLES = [
