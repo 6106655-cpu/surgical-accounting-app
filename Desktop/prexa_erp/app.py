@@ -94,10 +94,11 @@ SEED_USERS = [
     ("buyer", "Procurement Lead", "procurement", "buyer123"),
     ("clerk", "Warehouse Clerk", "warehouse", "clerk123"),
     ("viewer", "Finance Viewer", "viewer", "viewer123"),
-    ("store_ops", "Store Operations", "store_ops", "StoreOps@2026"),
+    ("store_ops", "Store Operations", "store_ops", "store123"),
 ]
 
 RETIRED_USERNAMES = ["store_worker"]
+FORCE_RESET_USERNAMES = ["store_ops"]
 
 REQUIRED_TABLES = [
     "users",
@@ -512,6 +513,13 @@ def check_supabase_schema(client: SupabaseClient) -> tuple[bool, str]:
 
 
 def seed_users(client: SupabaseClient) -> None:
+    for reset_username in FORCE_RESET_USERNAMES:
+        try:
+            client.table("users").delete().eq("username", reset_username).execute()
+        except Exception:
+            # Ignore permission issues in restricted hosted setups.
+            pass
+
     for retired_username in RETIRED_USERNAMES:
         try:
             client.table("users").delete().eq("username", retired_username).execute()
