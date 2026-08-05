@@ -1904,6 +1904,7 @@ def render_receipts(client: SupabaseClient) -> None:
     vendor_options = {vendor["vendor_name"]: vendor["id"] for vendor in vendors}
     st.markdown("### Simplified Inward Entry")
     st.caption("Only date, vendor, mapped item/stage, and quantity are required.")
+    st.caption("Saving inward updates vendor ledger liability automatically from quantity x mapped rate. Payment slips are created only from the Payment Slips section.")
 
     selected_vendor_name = st.selectbox(
         "Vendor Name",
@@ -1981,24 +1982,6 @@ def render_receipts(client: SupabaseClient) -> None:
                 },
             )
 
-            create_payment_slip(
-                client,
-                {
-                    "voucher_number": generate_payment_slip_number(client),
-                    "voucher_date": inward_date.isoformat(),
-                    "vendor_id": selected_vendor_id,
-                    "amount": auto_total_amount,
-                    PAYMENT_SLIP_TYPE_COLUMN: "Vendor",
-                    "tracking_number": receipt_number,
-                    "tracking_status": "Generated from Inward",
-                    "vendor_signature_name": "",
-                    "vendor_signature_date": inward_date.isoformat(),
-                    "operation_notes": f"Auto-generated from inward: {selected_item_label} x {float(quantity):.2f}",
-                    "approved_by": st.session_state["user"]["full_name"],
-                    "remarks": f"PAYEE: {selected_vendor_name}",
-                },
-            )
-
             st.session_state["last_inward_slip"] = {
                 "lot_number": lot_number,
                 "date": inward_date.isoformat(),
@@ -2009,7 +1992,7 @@ def render_receipts(client: SupabaseClient) -> None:
                 "calculated_amount": auto_total_amount,
             }
 
-            st.success("Inward entry saved. Total cost was calculated in the background and a Payment Slip was generated.")
+            st.success("Inward entry saved. Vendor ledger liability increased from quantity x rate. No payment slip was auto-generated.")
             st.rerun()
         except Exception as exc:
             st.error(f"Receipt could not be posted: {exc}")
