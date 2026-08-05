@@ -877,6 +877,24 @@ def render_delete_confirmation(state_key: str, record_id: int, label: str) -> bo
     return False
 
 
+def render_void_confirmation(state_key: str, record_id: int, label: str) -> bool:
+    if st.button("Void Selected Record", key=f"{state_key}_request"):
+        st.session_state[state_key] = record_id
+        st.rerun()
+
+    if st.session_state.get(state_key) == record_id:
+        st.warning(f"Confirm void for {label}. A reversal entry will be posted.")
+        confirm_col, cancel_col = st.columns(2)
+        if confirm_col.button("Confirm Void", key=f"{state_key}_confirm"):
+            st.session_state.pop(state_key, None)
+            return True
+        if cancel_col.button("Cancel", key=f"{state_key}_cancel"):
+            st.session_state.pop(state_key, None)
+            st.rerun()
+
+    return False
+
+
 def normalize_code_number(value: str, prefix: str) -> int:
     match = re.match(rf"^{prefix}-(\d+)$", value or "")
     if not match:
@@ -1366,6 +1384,49 @@ def delete_payment_slip(client: SupabaseClient, voucher_id: int) -> None:
     client.table(PAYMENT_SLIPS_TABLE).delete().eq("id", voucher_id).execute()
 
 
+def has_void_reversal_for_slip(client: SupabaseClient, voucher_number: str) -> bool:
+    rows = (
+        client.table(PAYMENT_SLIPS_TABLE)
+        .select("id")
+        .eq("tracking_status", "Void Reversal")
+        .eq("tracking_number", voucher_number)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+    return bool(rows)
+
+
+def void_payment_slip(client: SupabaseClient, slip: dict[str, Any], approved_by: str) -> None:
+    original_number = str(slip.get("voucher_number") or "").strip()
+    if not original_number:
+        raise ValueError("Missing original voucher number")
+
+    if has_void_reversal_for_slip(client, original_number):
+        raise ValueError("This payment slip is already voided via reversal.")
+
+    payee_name = str(slip.get("payee_name") or "Unknown").strip()
+    original_amount = abs(float(slip.get("amount") or 0.0))
+    create_payment_slip(
+        client,
+        {
+            "voucher_number": generate_payment_slip_number(client),
+            "voucher_date": date.today().isoformat(),
+            "vendor_id": slip.get("vendor_id"),
+            "amount": original_amount,
+            PAYMENT_SLIP_TYPE_COLUMN: slip.get("payee_type") or "Worker",
+            "tracking_number": original_number,
+            "tracking_status": "Void Reversal",
+            "vendor_signature_name": approved_by,
+            "vendor_signature_date": date.today().isoformat(),
+            "operation_notes": f"Void reversal for payment slip {original_number}",
+            "approved_by": approved_by,
+            "remarks": f"PAYEE: {payee_name}",
+        },
+    )
+
+
 def fetch_vendor_ledger_rows(client: SupabaseClient) -> list[dict[str, Any]]:
     lots = fetch_inward_lots(client)
     receipts = fetch_receipts(client)
@@ -1400,14 +1461,16 @@ def fetch_vendor_ledger_rows(client: SupabaseClient) -> list[dict[str, Any]]:
         vendor_id = slip.get("vendor_id")
         payee_name = str(slip.get("payee_name") or "").strip()
         vendor_name = str(slip.get("vendor_name") or payee_name or "Unknown")
-        amount = -abs(float(slip.get("amount") or 0.0))
+        tracking_status = str(slip.get("tracking_status") or "")
+        is_void_reversal = tracking_status.casefold() == "void reversal"
+        amount = abs(float(slip.get("amount") or 0.0)) if is_void_reversal else -abs(float(slip.get("amount") or 0.0))
         ledger_rows.append(
             {
                 "entry_id": f"slip-{slip.get('id')}",
                 "date": slip.get("voucher_date") or slip.get("created_at") or "",
                 "vendor_id": vendor_id,
                 "vendor_name": vendor_name,
-                "entry_type": "Payment",
+                "entry_type": "Payment Void" if is_void_reversal else "Payment",
                 "item_name": slip.get("description") or "Payment Slip",
                 "reference_number": slip.get("voucher_number"),
                 "quantity": 0.0,
@@ -1416,6 +1479,7 @@ def fetch_vendor_ledger_rows(client: SupabaseClient) -> list[dict[str, Any]]:
                 "amount": amount,
                 "sort_id": int(slip.get("id") or 0),
                 "payee_name": payee_name,
+                "tracking_status": tracking_status,
             }
         )
 
@@ -2082,6 +2146,7 @@ def render_payment_slips(client: SupabaseClient) -> None:
             {
                 "slip_number": row.get("voucher_number"),
                 "date": row.get("voucher_date"),
+                "status": row.get("tracking_status"),
                 "payee_type": row.get("payee_type"),
                 "payee_name": row.get("payee_name"),
                 "cash_amount": row.get("amount"),
@@ -2214,6 +2279,14 @@ def render_payment_slips(client: SupabaseClient) -> None:
             except Exception as exc:
                 st.error(f"Payment slip delete failed: {exc}")
 
+        if render_void_confirmation("confirm_void_payment_slip", selected_id, selected["voucher_number"]):
+            try:
+                void_payment_slip(client, selected, st.session_state["user"]["full_name"])
+                st.success("Payment slip voided using reversal entry.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Payment slip void failed: {exc}")
+
 
 def render_inward_summary(client: SupabaseClient) -> None:
     render_section_intro("inward_summary")
@@ -2319,10 +2392,12 @@ def render_vendor_ledger(client: SupabaseClient) -> None:
         st.dataframe(
             [
                 {
+                    "entry_id": row.get("entry_id"),
                     "date": row.get("date"),
                     "type": row.get("entry_type"),
                     "item_or_description": row.get("item_name"),
                     "reference": row.get("reference_number"),
+                    "status": row.get("tracking_status") or "",
                     "quantity": row.get("quantity"),
                     "amount": row.get("amount"),
                     "running_balance": row.get("running_balance"),
@@ -2332,6 +2407,45 @@ def render_vendor_ledger(client: SupabaseClient) -> None:
             use_container_width=True,
             hide_index=True,
         )
+
+        payment_entries = [row for row in ledger_rows if str(row.get("entry_id") or "").startswith("slip-")]
+        if payment_entries:
+            st.markdown("### Ledger Entry Actions")
+            st.caption("Delete a wrong payment entry or void it by posting a reversal.")
+            payment_entry_options = {
+                row["entry_id"]: (
+                    f"{row.get('reference_number')} | {row.get('date')} | "
+                    f"{float(row.get('amount') or 0.0):,.2f} | {row.get('entry_type')}"
+                )
+                for row in payment_entries
+            }
+            selected_payment_entry_id = st.selectbox(
+                "Select Payment Ledger Entry",
+                options=list(payment_entry_options.keys()),
+                format_func=lambda eid: payment_entry_options[eid],
+                key="ledger_payment_entry_action",
+            )
+            selected_payment_row = next((row for row in payment_entries if row.get("entry_id") == selected_payment_entry_id), None)
+            if selected_payment_row:
+                slip_id_text = str(selected_payment_row.get("entry_id") or "")
+                slip_id = int(slip_id_text.split("slip-", 1)[1])
+                slip_row = find_row_by_id(fetch_payment_slips(client), slip_id)
+                if slip_row:
+                    if render_delete_confirmation("confirm_delete_ledger_payment_slip", slip_id, str(slip_row.get("voucher_number") or slip_id_text)):
+                        try:
+                            delete_payment_slip(client, slip_id)
+                            st.success("Ledger payment entry deleted.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Ledger payment delete failed: {exc}")
+
+                    if render_void_confirmation("confirm_void_ledger_payment_slip", slip_id, str(slip_row.get("voucher_number") or slip_id_text)):
+                        try:
+                            void_payment_slip(client, slip_row, st.session_state["user"]["full_name"])
+                            st.success("Ledger payment entry voided using reversal entry.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Ledger payment void failed: {exc}")
     else:
         st.caption("No inward lots or payment slips recorded yet for this vendor.")
 
